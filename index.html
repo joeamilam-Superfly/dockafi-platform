@@ -76,7 +76,9 @@ a{color:var(--teal-light);text-decoration:none;}
 .panel.active{display:block;}
 
 /* ── METRICS ── */
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px;}
+.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:24px;}
+@media (max-width:1100px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media (max-width:720px){.metrics{grid-template-columns:1fr 1fr;}}
 .metric{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px 20px;}
 .metric-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}
 .metric-value{font-size:26px;font-weight:600;color:var(--text);line-height:1;}
@@ -948,12 +950,74 @@ const PORTAL_URL = 'https://dockafiplatform.netlify.app/?portal=1';
 
 let SESSION = null;
 let currentView = 'auth';
+let currentDeviceSerial = null;
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function jwtExpMs(token) {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return (payload.exp || 0) * 1000;
+  } catch { return 0; }
+}
+const ORG_DELETED_RE = /\[DOCKAFI_DELETED(?: orig:([a-z]+))?\]/;
+function isOrgDeleted(o) { return ORG_DELETED_RE.test(o?.notes || ''); }
+function stripOrgDeletedMark(notes) {
+  return String(notes || '').replace(/\s*\[DOCKAFI_DELETED(?: orig:[a-z]+)?\]/g, '').trim();
+}
+
+async function requestJson(url, opts = {}) {
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  return { res, data, text };
+}
 
 // ── API HELPERS ──
+async function ensureSession() {
+  if (!SESSION?.access_token) return false;
+  const exp = jwtExpMs(SESSION.access_token);
+  if (Date.now() < exp - 30000) return true;
+  if (!SESSION.refresh_token) return false;
+  try {
+    const data = await authApi('/token?grant_type=refresh_token', { refresh_token: SESSION.refresh_token });
+    SESSION = data;
+    localStorage.setItem('dockafi_session', JSON.stringify(data));
+    return true;
+  } catch {
+    SESSION = null;
+    localStorage.removeItem('dockafi_session');
+    localStorage.removeItem('dockafi_email');
+    return false;
+  }
+}
+
 async function api(path, opts = {}) {
+  if (SESSION?.access_token) {
+    const ok = await ensureSession();
+    if (!ok) throw new Error('Session expired — please sign in again');
+  }
   const headers = {
     'apikey': SUPABASE_ANON_KEY,
     'Authorization': 'Bearer ' + (SESSION?.access_token || SUPABASE_ANON_KEY),
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation'
+  };
+  const res = await fetch(SUPABASE_URL + path, { ...opts, headers: { ...headers, ...opts.headers } });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || err.error_description || 'Request failed');
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function anonApi(path, opts = {}) {
+  const headers = {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
     'Content-Type': 'application/json',
     'Prefer': 'return=representation'
   };
@@ -1065,7 +1129,8 @@ function nav(panel) {
     orgs: loadOrgs,
     requests: loadRequests,
     billing: loadBilling,
-    orders: loadOrders
+    orders: loadOrders,
+    help: initHelpRenewalSettings
   };
   if (loaders[panel]) loaders[panel]();
 }
@@ -1073,14 +1138,13 @@ function nav(panel) {
 // ── DASHBOARD ──
 async function loadDashboard() {
   try {
-    const [devices, requests, subs] = await Promise.all([
-      api('/rest/v1/devices?select=status&status=neq.deleted'),
+    const [devices, requests, subs, pendingOrders] = await Promise.all([
+      api('/rest/v1/devices?select=status&status=neq.inactive'),
       api('/rest/v1/service_requests?select=status&status=neq.actioned'),
-      api('/rest/v1/subscriptions?select=status,monthly_amount')
+      api('/rest/v1/subscriptions?select=status,monthly_amount'),
+      api('/rest/v1/orders_queue?select=id&status=eq.pending_shipment')
     ]);
     const total = devices.length;
-    const active = devices.filter(d => d.status === 'active').length;
-    // Revenue-producing = active device + active subscription
     const revenue = subs.filter(s => s.status === 'active').length;
     const suspended = devices.filter(d => d.status === 'suspended').length;
     const openReqs = requests.filter(r => r.status !== 'actioned').length;
@@ -1090,6 +1154,8 @@ async function loadDashboard() {
     document.getElementById('m-suspended').textContent = suspended;
     document.getElementById('m-requests').textContent = openReqs;
     document.getElementById('m-mrr').textContent = '$' + mrr.toFixed(0) + ' / month';
+    const ordersEl = document.getElementById('m-orders');
+    if (ordersEl) ordersEl.textContent = pendingOrders.length;
     if (openReqs > 0) {
       const b = document.getElementById('req-badge');
       b.textContent = openReqs;
@@ -1110,22 +1176,15 @@ async function loadDashDevices() {
     if (!rows.length) { tbody.innerHTML = '<tr><td colspan="5"><div class="empty"><i class="ti ti-device-desktop-off"></i>No devices yet</div></td></tr>'; return; }
     tbody.innerHTML = rows.map(d => {
       const euList = (d.device_enduser||[]).filter(de=>de.status==='active').map(de=>de.end_users).filter(Boolean);
-      const euName = euList.length ? euList.map(e=>e.first_name+' '+e.last_name).join(', ') : '<span style="color:var(--text3);">Unassigned</span>';
+      const euName = euList.length ? esc(euList.map(e=>e.first_name+' '+e.last_name).join(', ')) : '<span style="color:var(--text3);">Unassigned</span>';
       const deviceOrg = d.organizations?.name || null;
       const euOrg = euList.length ? ([...new Set(euList.map(e=>e.organizations?.name).filter(Boolean))].join(', ')||null) : null;
-      const reseller = deviceOrg || euOrg || '<span style="color:var(--text3);">—</span>';
-      return `<tr class="row-link" onclick="openDeviceDetail('${d.serial_number}')">
-        <td><strong>${d.serial_number}</strong></td>
-        <td class="mono">${d.imei}</td>
+      const reseller = deviceOrg || euOrg ? esc(deviceOrg || euOrg) : '<span style="color:var(--text3);">—</span>';
+      return `<tr class="row-link" onclick="openDeviceDetail('${esc(d.serial_number)}')">
+        <td><strong>${esc(d.serial_number)}</strong><div class="mono" style="font-size:10px;color:var(--text3);margin-top:2px;">${esc(d.imei)}</div></td>
         <td>${euName}</td>
         <td>${reseller}</td>
         <td>${statusBadge(d.status)}</td>
-        <td style="text-align:center;white-space:nowrap;">
-          ${d.status === 'inactive'
-            ? `<button class="btn btn-success btn-sm" style="padding:4px 10px;font-size:11px;" onclick="event.stopPropagation();restoreDevice('${d.serial_number}')"><i class="ti ti-refresh" style="font-size:12px;"></i> Restore</button>`
-            : `<button class="btn btn-sm" style="padding:4px 10px;font-size:11px;" onclick="event.stopPropagation();openEditDevice('${d.serial_number}')"><i class="ti ti-pencil" style="font-size:12px;"></i> Edit</button>`
-          }
-        </td>
       </tr>`;
     }).join('');
   } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red);padding:16px;">Error loading devices</td></tr>'; }
@@ -1200,6 +1259,7 @@ async function loadDevices() {
 }
 
 async function openDeviceDetail(serial) {
+  currentDeviceSerial = serial;
   nav('device-detail');
   const el = document.getElementById('device-detail-content');
   el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading device...</div>';
@@ -1267,8 +1327,8 @@ async function updateDeviceStatus(id, status) {
   try {
     await api('/rest/v1/devices?id=eq.' + id, { method: 'PATCH', body: JSON.stringify({ status }) });
     toast('Device status updated to ' + status, 'success');
-    const serial = document.getElementById('page-title').textContent;
-    openDeviceDetail(serial);
+    const serial = currentDeviceSerial || document.getElementById('ed-serial')?.value;
+    if (serial) openDeviceDetail(serial);
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 
@@ -1285,6 +1345,12 @@ async function addDevice() {
   if (!serial || !imei) { toast('Serial number and IMEI are required', 'error'); return; }
   if (imei.length !== 15 || !/^\d{15}$/.test(imei)) { toast('IMEI must be exactly 15 digits', 'error'); return; }
   try {
+    if (await addDeviceOrRestore(serial, imei)) {
+      closeModal('modal-add-device');
+      toast('Existing deleted device restored as ' + serial, 'success');
+      loadDevices();
+      return;
+    }
     const orgs = await api('/rest/v1/organizations?type=eq.manufacturer&select=id&limit=1');
     const mfrId = orgs?.[0]?.id;
     await api('/rest/v1/devices', {
@@ -1355,8 +1421,9 @@ function openAddEndUser() {
 
 async function loadResellersIntoSelect(selectId) {
   const sel = document.getElementById(selectId);
-  const orgs = await api('/rest/v1/organizations?type=in.(reseller,distributor)&select=id,name&order=name');
-  sel.innerHTML = '<option value="">Select reseller...</option>' + orgs.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
+  const orgs = await api('/rest/v1/organizations?type=in.(reseller,distributor)&select=id,name,notes&order=name');
+  const live = (orgs || []).filter(o => !isOrgDeleted(o));
+  sel.innerHTML = '<option value="">Select reseller...</option>' + live.map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
 }
 
 async function addEndUser() {
@@ -1406,15 +1473,17 @@ async function loadOrgs() {
   tbody.innerHTML = '<tr><td colspan="9"><div class="loading"><div class="spinner"></div>Loading...</div></td></tr>';
   try {
     const showDeletedOrgs = document.getElementById('show-deleted-orgs')?.checked;
-    const rows = await api('/rest/v1/organizations?select=*&order=type,name' + (showDeletedOrgs ? '&type=eq.deleted' : '&type=neq.deleted'));
+    const all = await api('/rest/v1/organizations?select=*&order=type,name');
+    const rows = (all || []).filter(o => showDeletedOrgs ? isOrgDeleted(o) : !isOrgDeleted(o));
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6"><div class="empty"><i class="ti ti-building"></i>No organizations found</div></td></tr>'; return; }
     tbody.innerHTML = rows.map(o => `<tr>
-      <td><strong style="color:var(--text);">${o.name}</strong></td>
+      <td><strong style="color:var(--text);">${esc(o.name)}</strong></td>
       <td>${orgTypeBadge(o.type)}</td>
-      <td>${o.contact_name || '—'}</td>
-      <td style="color:var(--text2);">${o.contact_email || '—'}</td>
-      <td>${o.contact_phone || '—'}</td>
+      <td>${esc(o.contact_name) || '—'}</td>
+      <td style="color:var(--text2);">${esc(o.contact_email) || '—'}</td>
+      <td>${esc(o.contact_phone) || '—'}</td>
       <td style="text-align:center;white-space:nowrap;">
-        ${o.type === 'deleted'
+        ${isOrgDeleted(o)
           ? `<button class="btn btn-success btn-sm" style="padding:4px 10px;font-size:11px;" onclick="restoreOrg('${o.id}')"><i class="ti ti-refresh" style="font-size:12px;"></i> Restore</button>`
           : `<button class="btn btn-sm" style="padding:4px 10px;font-size:11px;" onclick="openEditOrg('${o.id}')"><i class="ti ti-pencil" style="font-size:12px;"></i> Edit</button>`
         }
@@ -1473,8 +1542,9 @@ async function openRequestDetail(id) {
   const el = document.getElementById('request-detail-content');
   el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
   try {
-    const rows = await api('/rest/v1/service_requests?id=eq.' + id + '&select=*');
+    const rows = await api('/rest/v1/service_requests?id=eq.' + encodeURIComponent(id) + '&select=*');
     const r = rows[0];
+    if (!r) { el.innerHTML = '<p style="color:var(--red);">Request not found.</p>'; return; }
     const isSuspend = r.request_type === 'suspend';
     const isActioned = r.status === 'actioned';
     el.innerHTML = `
@@ -1521,7 +1591,7 @@ async function actionRequest(id, isSuspend) {
       method: 'PATCH',
       body: JSON.stringify({ status: 'actioned', actioned_at: new Date().toISOString() })
     });
-    toast('Request marked as actioned. Email notifications queued.', 'success');
+    toast('Request marked as actioned.', 'success');
     openRequestDetail(id);
     const badge = document.getElementById('req-badge');
     const cur = parseInt(badge.textContent) - 1;
@@ -1580,26 +1650,30 @@ async function doScan() {
   if (!val) return;
   clearScanResult();
   try {
-    let rows = await api('/rest/v1/devices?serial_number=eq.' + encodeURIComponent(val) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(end_users(first_name,last_name))');
-    if (!rows.length) rows = await api('/rest/v1/devices?imei=eq.' + encodeURIComponent(val) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(end_users(first_name,last_name))');
-    if (!rows.length && val.length >= 5) rows = await api('/rest/v1/devices?imei_last5=eq.' + encodeURIComponent(val.slice(-5)) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(end_users(first_name,last_name))');
-    if (!rows.length) { const simRows = await api('/rest/v1/sim_cards?iccid=eq.' + encodeURIComponent(val) + '&select=iccid,devices(serial_number,imei,status)'); if (simRows.length) rows = [{ ...simRows[0].devices, sim_cards: [{ iccid: simRows[0].iccid }] }]; }
+    let rows = await api('/rest/v1/devices?serial_number=eq.' + encodeURIComponent(val) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(status,end_users(first_name,last_name))');
+    if (!rows.length) rows = await api('/rest/v1/devices?imei=eq.' + encodeURIComponent(val) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(status,end_users(first_name,last_name))');
+    if (!rows.length && val.length >= 5) rows = await api('/rest/v1/devices?imei_last5=eq.' + encodeURIComponent(val.slice(-5)) + '&select=serial_number,imei,status,sim_cards(iccid),device_enduser(status,end_users(first_name,last_name))');
+    if (!rows.length) {
+      const simRows = await api('/rest/v1/sim_cards?iccid=eq.' + encodeURIComponent(val) + '&select=iccid,devices(serial_number,imei,status,device_enduser(status,end_users(first_name,last_name)))');
+      if (simRows.length && simRows[0].devices) rows = [{ ...simRows[0].devices, sim_cards: [{ iccid: simRows[0].iccid }] }];
+    }
     if (!rows.length) { document.getElementById('scan-notfound').style.display = 'block'; return; }
     const d = rows[0];
     const eu = (d.device_enduser||[]).find(de=>de.status==='active')?.end_users;
     const resultEl = document.getElementById('scan-result');
     resultEl.style.display = 'block';
+    const iccid = d.sim_cards?.[0]?.iccid;
     resultEl.innerHTML = `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:16px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <strong style="color:var(--text);font-size:15px;">${d.serial_number}</strong>
+        <strong style="color:var(--text);font-size:15px;">${esc(d.serial_number)}</strong>
         ${statusBadge(d.status)}
       </div>
       <div class="detail-grid" style="margin-bottom:12px;">
-        <div class="detail-field"><div class="df-label">IMEI</div><div class="df-value mono">${d.imei}</div></div>
-        <div class="detail-field"><div class="df-label">SIM ICCID</div><div class="df-value mono">${d.sim_cards?.[0]?.iccid?.slice(0,12) + '...' || '—'}</div></div>
-        <div class="detail-field"><div class="df-label">End user</div><div class="df-value">${eu ? eu.first_name + ' ' + eu.last_name : 'Unassigned'}</div></div>
+        <div class="detail-field"><div class="df-label">IMEI</div><div class="df-value mono">${esc(d.imei)}</div></div>
+        <div class="detail-field"><div class="df-label">SIM ICCID</div><div class="df-value mono">${iccid ? esc(iccid.slice(0,12)) + '...' : '—'}</div></div>
+        <div class="detail-field"><div class="df-label">End user</div><div class="df-value">${eu ? esc(eu.first_name + ' ' + eu.last_name) : 'Unassigned'}</div></div>
       </div>
-      <button class="btn btn-primary btn-sm" onclick="openDeviceDetail('${d.serial_number}')">Open full record</button>
+      <button class="btn btn-primary btn-sm" onclick="openDeviceDetail('${esc(d.serial_number)}')">Open full record</button>
     </div>`;
   } catch(e) { toast('Scan error: ' + e.message, 'error'); }
 }
@@ -1637,25 +1711,56 @@ async function submitPortalRequest() {
       : (document.getElementById('p-reason').value || 'Not specified');
     const ref = 'REQ-' + Date.now().toString(36).toUpperCase().slice(-6);
 
-    // Submit through Netlify function which uses service role key to bypass RLS
-    const res = await fetch('/api/submit-request', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        reference: ref,
-        request_type: type.value,
-        submitted_name: name,
-        submitted_email: email,
-        submitted_imei_last5: imei,
-        detail,
-        notes: notes || null
-      })
-    });
-    const data = await res.json();
+    const payload = {
+      reference: ref,
+      request_type: type.value,
+      submitted_name: name,
+      submitted_email: email,
+      submitted_imei_last5: imei,
+      detail,
+      notes: notes || null
+    };
 
-    if (!res.ok || data.error) {
-      if (res.status === 404) { errEl.style.display = 'block'; return; }
-      throw new Error(data.error || 'Submission failed');
+    // Submit through Netlify function (matches email + IMEI last 5, then inserts).
+    let submitted = false;
+    try {
+      const { res, data } = await requestJson('/api/submit-request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const fromFn = data && typeof data === 'object' && !data.raw;
+      if (res.status === 404 && fromFn) { errEl.style.display = 'block'; return; }
+      if (res.ok && fromFn && !data.error) submitted = true;
+      else if (fromFn && res.status >= 400 && res.status < 500) {
+        throw new Error(data.error || 'Submission failed');
+      }
+    } catch (fnErr) {
+      if (fnErr.message && (fnErr.message.includes('required') || fnErr.message.includes('must be'))) throw fnErr;
+    }
+
+    if (!submitted) {
+      const devices = await anonApi('/rest/v1/devices?imei_last5=eq.' + encodeURIComponent(imei) + '&select=id,device_enduser(status,end_users(id,email,email_normalized,reseller_org_id))');
+      let matchedDevice = null, matchedUser = null;
+      for (const d of devices || []) {
+        for (const link of (d.device_enduser || []).filter(l => l.status === 'active')) {
+          const u = link.end_users;
+          const uEmail = (u?.email_normalized || u?.email || '').toLowerCase();
+          if (u && uEmail === email) { matchedDevice = d; matchedUser = u; break; }
+        }
+        if (matchedUser) break;
+      }
+      if (!matchedUser) { errEl.style.display = 'block'; return; }
+      await anonApi('/rest/v1/service_requests', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...payload,
+          device_id: matchedDevice.id,
+          end_user_id: matchedUser.id,
+          reseller_org_id: matchedUser.reseller_org_id || null,
+          status: 'new'
+        })
+      });
     }
 
     document.getElementById('p-conf-ref').textContent = ref;
@@ -1703,7 +1808,7 @@ async function loadOrders(){
   if(pending>0){b.textContent=pending;b.style.display='';}else b.style.display='none';
   tbody.innerHTML=rows.map(r=>{
     const hwLabel=r.hardware_type==='device'?'<span class="badge badge-new">New device</span>':'<span class="badge badge-inactive">Existing</span>';
-    return '<tr class="row-link" onclick="openOrderDetail(\''+r.id+'\')"><td><strong style="color:var(--text);">'+r.customer_name+'</strong></td><td style="color:var(--text2);font-size:12px;">'+r.customer_email+'</td><td>'+hwLabel+'</td><td>'+(r.plan_type||'—')+'</td><td class="mono">'+(r.imei_last5?'··· '+r.imei_last5:'<span style="color:var(--text3);">—</span>')+'</td><td style="color:var(--teal-light);font-weight:500;">'+(r.order_total?'$'+parseFloat(r.order_total).toFixed(2):'—')+'</td><td style="color:var(--text3);">'+fmtDate(r.created_at)+'</td><td>'+orderStatusBadge(r.status)+'</td></tr>';
+    return '<tr class="row-link" onclick="openOrderDetail(\''+esc(r.id)+'\')"><td><strong style="color:var(--text);">'+esc(r.customer_name)+'</strong></td><td style="color:var(--text2);font-size:12px;">'+esc(r.customer_email)+'</td><td>'+resellerLabel(r.source)+'</td><td>'+hwLabel+'</td><td>'+esc(r.plan_type||'—')+'</td><td class="mono">'+(r.imei_last5?'··· '+esc(r.imei_last5):'<span style="color:var(--text3);">—</span>')+'</td><td style="color:var(--teal-light);font-weight:500;">'+(r.order_total?'$'+parseFloat(r.order_total).toFixed(2):'—')+'</td><td style="color:var(--text3);">'+fmtDate(r.created_at)+'</td><td>'+orderStatusBadge(r.status)+'</td></tr>';
   }).join('');}
   catch(e){tbody.innerHTML='<tr><td colspan="9" style="color:var(--red);padding:16px;">Error: '+e.message+'</td></tr>';}
 }
@@ -1726,12 +1831,41 @@ async function openOrderDetail(id){
 async function shipOrder(orderId,email,planType,orderTotal){
   const imei=document.getElementById('ship-imei').value.trim();
   if(!imei||!/^\d{15}$/.test(imei)){toast('Please scan or enter the full 15-digit IMEI','error');return;}
-  try{const orgs=await api('/rest/v1/organizations?type=eq.manufacturer&select=id&limit=1');
-  const mfrId=orgs?.[0]?.id;
-  const serial='DKF-'+Date.now().toString(36).toUpperCase().slice(-5)+Math.floor(Math.random()*10);
-  await api('/rest/v1/devices',{method:'POST',body:JSON.stringify({serial_number:serial,imei,status:'active',manufactured_by:mfrId||null})});
-  await api('/rest/v1/orders_queue?id=eq.'+orderId,{method:'PATCH',body:JSON.stringify({status:'activated',activated_at:new Date().toISOString()})});
-  toast('Device '+serial+' registered and activated','success');nav('orders');}
+  try{
+    const orderRows=await api('/rest/v1/orders_queue?id=eq.'+encodeURIComponent(orderId)+'&select=imei_last5,customer_name,customer_email,customer_phone');
+    const order=orderRows?.[0]||{};
+    if(order.imei_last5 && imei.slice(-5)!==order.imei_last5){
+      if(!confirm('IMEI last 5 ('+imei.slice(-5)+') does not match the order ('+order.imei_last5+'). Continue anyway?')) return;
+    }
+    const existing=await api('/rest/v1/devices?imei=eq.'+encodeURIComponent(imei)+'&select=id,serial_number,status');
+    let serial, deviceId;
+    if(existing.length){
+      serial=existing[0].serial_number;
+      deviceId=existing[0].id;
+      if(existing[0].status==='inactive'){
+        await api('/rest/v1/devices?id=eq.'+deviceId,{method:'PATCH',body:JSON.stringify({status:'unassigned'})});
+      }
+    }else{
+      const orgs=await api('/rest/v1/organizations?type=eq.manufacturer&select=id&limit=1');
+      const mfrId=orgs?.[0]?.id;
+      serial='DKF-'+Date.now().toString(36).toUpperCase().slice(-5)+Math.floor(Math.random()*10);
+      const created=await api('/rest/v1/devices',{method:'POST',body:JSON.stringify({serial_number:serial,imei,status:'unassigned',manufactured_by:mfrId||null})});
+      deviceId=Array.isArray(created)?created[0]?.id:created?.id;
+    }
+    const custEmail=(email||order.customer_email||'').toLowerCase();
+    if(custEmail && deviceId){
+      const users=await api('/rest/v1/end_users?email_normalized=eq.'+encodeURIComponent(custEmail)+'&select=id,status&limit=1');
+      if(users.length && users[0].status==='active'){
+        const existingLinks=await api('/rest/v1/device_enduser?device_id=eq.'+deviceId+'&status=eq.active&select=id');
+        if(!existingLinks.length){
+          await api('/rest/v1/device_enduser',{method:'POST',body:JSON.stringify({device_id:deviceId,end_user_id:users[0].id,status:'active'})});
+        }
+      }
+    }
+    await api('/rest/v1/orders_queue?id=eq.'+orderId,{method:'PATCH',body:JSON.stringify({status:'activated',activated_at:new Date().toISOString()})});
+    toast('Order activated against device '+serial+'. Confirm Tello, then Activate on the device record.','success');
+    nav('orders');
+  }
   catch(e){toast('Error: '+e.message,'error');}
 }
 
@@ -1805,24 +1939,51 @@ async function linkDeviceToEndUser() {
       }
     }
     // Cancel any existing active link for this device before creating new one
-    const existingLinks = await api('/rest/v1/device_enduser?device_id=eq.'+deviceId+'&status=eq.active&select=id');
-    for (const lnk of existingLinks) {
-      await api('/rest/v1/device_enduser?id=eq.'+lnk.id, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'cancelled' })
+    const existingLinks = await api('/rest/v1/device_enduser?device_id=eq.'+deviceId+'&status=eq.active&select=id,end_user_id');
+    const sameUser = existingLinks.find(lnk => lnk.end_user_id === endUserId);
+    let linkId;
+    if (sameUser) {
+      linkId = sameUser.id;
+      const existingSubs = await api('/rest/v1/subscriptions?device_enduser_id=eq.'+linkId+'&select=id,status');
+      if (existingSubs.some(s => s.status === 'active')) {
+        closeModal('modal-link-device');
+        toast('This device is already linked to that end user with an active subscription', 'success');
+        loadDevices();
+        loadEndUsers();
+        return;
+      }
+    } else {
+      for (const lnk of existingLinks) {
+        const oldSubs = await api('/rest/v1/subscriptions?device_enduser_id=eq.'+lnk.id+'&select=id,status');
+        for (const sub of oldSubs) {
+          if (sub.status === 'active') {
+            await api('/rest/v1/subscriptions?id=eq.'+sub.id, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: 'cancelled' })
+            });
+          }
+        }
+        await api('/rest/v1/device_enduser?id=eq.'+lnk.id, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'cancelled' })
+        });
+      }
+      const euActive = await api('/rest/v1/device_enduser?end_user_id=eq.'+endUserId+'&status=eq.active&select=id');
+      if (euActive.length && !confirm('This end user already has another active device. Continue and keep both links?')) {
+        return;
+      }
+      const linkRows = await api('/rest/v1/device_enduser', {
+        method: 'POST',
+        body: JSON.stringify({
+          device_id: deviceId,
+          end_user_id: endUserId,
+          assigned_by_org_id: assignedByOrgId,
+          status: 'active',
+          activated_at: date ? new Date(date + 'T12:00:00').toISOString() : new Date().toISOString()
+        })
       });
+      linkId = Array.isArray(linkRows) ? linkRows[0]?.id : linkRows?.id;
     }
-    const linkRows = await api('/rest/v1/device_enduser', {
-      method: 'POST',
-      body: JSON.stringify({
-        device_id: deviceId,
-        end_user_id: endUserId,
-        assigned_by_org_id: assignedByOrgId,
-        status: 'active',
-        activated_at: date ? new Date(date).toISOString() : new Date().toISOString()
-      })
-    });
-    const linkId = Array.isArray(linkRows) ? linkRows[0]?.id : linkRows?.id;
     if (!linkId) throw new Error('Failed to create device link');
     const nextBilling = new Date(date || new Date());
     nextBilling.setMonth(nextBilling.getMonth() + 1);
@@ -1862,6 +2023,22 @@ async function linkDeviceToEndUser() {
 const GUIDE_CONTEXT = 'DockaFI Platform Operations Guide Confidential AquaEase\n\n DOCKAFI Platform Operations Guide AquaEase Device Management System Carrier: Tello Mobile (T-Mobile network) Version 2.0 │ Confidential \n\nIntroduction\n\nThe DockaFI platform is AquaEase\'s internal management system for tracking devices, SIM cards, end users, subscriptions, and service requests. SIM cards are managed through Tello Mobile on the T-Mobile network.\n\nPlatform URLs\n\n Location URL \n --- \n Admin platform dockafiplatform.netlify.app \n End user portal dockafiplatform.netlify.app/?portal=1 \n Marketing site dockafi.com \n SDS partner page dockafi.com/partners/southeastern-dock-supply \n Dock Depot page dockafi.com/partners/dock-depot \n Setup guide dockafi.com/setup-guide \n Tello account tello.com/account \n\nThe Distribution Chain\n\nDevices flow through three stages:\n\n- AquaEase — manufactures and registers devices\n\n- Reseller organization — receives devices, sells to end users\n\n- End user — the customer paying the monthly subscription\n\nYou can assign a device to a reseller before an end user is known, then add the end user later when an order arrives.\n\n1. Signing In\n\nGo to dockafiplatform.netlify.app and enter your email and password. Your session persists across page refreshes. Sessions expire after one hour of inactivity.\n\n Tip: To create a new admin account click Create admin account, confirm your email from the inbox link, then sign in. \n\n2. Adding a New Device\n\nRegister every DockaFI unit when you receive inventory. Click Add device in the top right of the Device registry panel.\n\n Field What to enter \n --- \n Serial number Format DKF-XXXX from the device label \n IMEI Full 15-digit number — scan barcode on label inside port cover \n MAC address From the same label, format XX:XX:XX:XX:XX:XX \n Model Defaults to DF0001 — leave as is \n Reseller organization Select the reseller receiving this device if known \n Notes Optional internal notes \n\nClick Add device. The device appears in the registry with status Unassigned.\n\n Note: The IMEI must be entered correctly. It is the primary identifier linking the device to the end user during portal authentication and service requests. \n\nAssigning a Device to a Reseller\n\nTo assign a device to a reseller before an end user is known, click Edit on the device row, select the reseller from the Reseller organization dropdown, and save. The reseller shows in the device table immediately. When an end user is later linked to this device they will automatically inherit the same reseller organization.\n\n3. Adding and Managing SIM Cards\n\nSIM cards must be added and paired to a device before a device can be fully activated. Each SIM has a unique ICCID and an activation code used to activate the line with Tello.\n\nAdding a New SIM Card\n\n- Click SIM cards in the left sidebar\n\n- Click Add SIM\n\n- Enter the ICCID — 19 or 20 digit number printed on the SIM card\n\n- Enter the Activation code — used to activate the line with Tello\n\n- Enter MSISDN (phone number) if already assigned by Tello\n\n- Select the carrier — defaults to Tello / T-Mobile\n\n- Enter the data plan — defaults to 50 GB Monthly\n\n- Leave status as Unactivated until the line is confirmed live with Tello\n\n- Enter the device IMEI to pair this SIM to a specific device\n\n- Click Add SIM\n\nEditing a SIM Card\n\nClick Edit on any SIM card row to update details, change the paired device, or update status. To move a SIM to a different device enter the new device\'s full 15-digit IMEI and save.\n\n Note: Each device can only have one SIM at a time. Unpair the existing SIM before assigning a new one to the same device. \n\nSIM Card Status Values\n\n Status Meaning \n --- \n Unactivated SIM added but not yet live with Tello \n Active Line confirmed live, data plan running \n Suspended Line temporarily paused in Tello \n Deactivated Line permanently cancelled in Tello \n\n4. Managing Organizations\n\nOrganizations represent the companies in your distribution chain. Add reseller partners before assigning devices or adding their end users.\n\nAdding an Organization\n\n- Click Organizations in the left sidebar\n\n- Click Add organization\n\n- Enter the name and select type — Reseller, Distributor, or Manufacturer\n\n- Enter contact name, email, and phone\n\n- Click Add organization\n\n Tip: AquaEase is already in the system as manufacturer. Current resellers: Southeastern Dock Supply and The Dock Depot. \n\nEditing, Deleting, and Restoring\n\nClick Edit to update details. Click Delete to soft-delete (hidden but restorable). Check Show deleted to see deleted organizations and click Restore to bring one back.\n\n5. Adding and Managing End Users\n\nEnd users are the customers paying for service. Add them after setting up their reseller organization.\n\nAdding an End User\n\n- Click End users in the left sidebar\n\n- Click Add end user\n\n- Enter first name, last name, email, phone, and dock location\n\n- Select their reseller from the dropdown\n\n- Click Add end user\n\n Note: The email must match exactly what the customer uses on the end user portal. If it does not match, portal authentication will fail. \n\nEditing, Deleting, and Restoring\n\nClick Edit to update details. Deleting an end user releases their device back to Unassigned. Check Show deleted to see and restore deleted users.\n\n Tip: If you add an end user with an email matching a deleted record, the platform asks if you want to restore and update the existing record instead of creating a duplicate. \n\n6. Linking a Device to an End User\n\nLinking connects a device to a customer and creates their subscription record. Do this when a device is ready to ship.\n\n- Click Link device in the Devices or End users panel\n\n- Select the device\n\n- Select the end user\n\n- Enter plan name — example: 50 GB Monthly\n\n- Enter monthly fee — example: 55.00\n\n- Set the activation date\n\n- Click Link and activate\n\nThis creates the device-enduser link, subscription record, and sets the device status. The next billing date is set to one month from today automatically.\n\nReassigning a Device\n\nClick Edit on the device, select the new end user from the Assign to end user dropdown, and save. The old link is cancelled and a new active link is created for the new user.\n\n Tip: If a device has a reseller org set and the end user has none, the end user automatically inherits the device\'s reseller when linked. \n\n7. Activating a Device\n\nActivation marks a device as revenue-producing. It sets the device, SIM, and subscription all to Active in one click and stamps all relevant dates.\n\nHow to Activate\n\nOpen any device from the Device registry by clicking its serial number. At the bottom click the Activate button.\n\n Record What changes on activation \n --- \n Device status set to Active \n SIM card status set to Active, activated_at stamped with today \n Subscription status set to Active, started_at stamped, next_billing_date set one month out \n\n Note: Confirm the SIM is live with Tello before clicking Activate. The platform sets status but does not communicate with Tello. Activate in the platform only after Tello confirms the line is active. \n\n Tip: If no SIM is paired when you click Activate, the device and subscription activate but the SIM step is skipped. Pair the SIM and set it to Active manually from the SIM cards panel. \n\nRevenue Active Dashboard Metric\n\nThe Revenue Active metric on the dashboard counts active subscriptions — not just device status. This is your true count of paying customers.\n\n8. Processing Orders from Partner Pages\n\nWhen a customer purchases on the SDS or Dock Depot partner pages their order appears automatically in the Orders queue.\n\n- Click Orders in the left sidebar — badge shows pending count\n\n- Click the order row to open the detail\n\n- Review customer name, email, plan, order type, reseller, and shipping address\n\n- Select and prepare a device from inventory — pair its SIM in Tello\n\n- Click Mark shipped\n\n- After the customer is confirmed live, open the device and click Activate\n\n Tip: The Reseller column on each order shows which partner page it came from — Southeastern Dock Supply or The Dock Depot. Shipping address entered at checkout appears in the order detail. \n\n Note: Always activate the Tello SIM at tello.com/account before or on the same day you ship. \n\n9. Handling Suspension Requests\n\nWhen a customer submits a suspension request through the portal it appears in the Requests queue. The platform tracks the request but the SIM must be paused manually in Tello.\n\n- Click Requests in the left sidebar — badge shows open count\n\n- Click the request row to open the detail\n\n- Note the customer name, email, and IMEI last 5 digits\n\n- Open a new tab — go to tello.com and sign in\n\n- Find the customer\'s line in My Account by phone number or IMEI\n\n- Select pause or suspend — confirm in Tello\n\n- Return to the platform — click Mark as actioned\n\n Tip: Tello account portal: tello.com/account — bookmark this for quick access. \n\n10. Handling Cancellation Requests\n\nCancellations follow the same process as suspensions but the SIM is permanently deactivated.\n\n- Click Requests in the left sidebar\n\n- Click the cancellation request\n\n- Note the IMEI last 5 and billing period end date\n\n- Go to tello.com and sign in\n\n- Find the customer\'s line in My Account\n\n- Select cancel or deactivate — confirm in Tello\n\n- Return to the platform and click Mark as actioned\n\n Note: Billing stops at the end of the current billing period, not immediately. Check the billing period end date before deactivating so the customer keeps service through their paid period. \n\n11. Dashboard\n\nThe dashboard gives you an at-a-glance view of your fleet.\n\nMetric Cards\n\n Metric What it means \n --- \n Total devices All registered devices excluding deleted records \n Revenue Active Devices with an active subscription — your paying customers \n Suspended Devices with temporarily paused service \n Open requests Suspension and cancellation requests needing action \n Pending orders Purchase page orders not yet shipped \n\nUpcoming Renewals Card\n\nShows all active subscriptions renewing within your alert window. Days remaining are color coded — amber at 5 days or fewer, red and bold at 2 days or fewer.\n\nUse the Alert window dropdown in the card header to show renewals 3, 5, 7, 14, or 30 days out. Your selection is saved across sessions.\n\nRenewal Email Alerts\n\nEach time you open the dashboard the platform checks for upcoming renewals and sends an email alert to joeamilam@gmail.com if any are found within your alert window. The email is sent once per day.\n\nTo adjust the email address, alert window, or send a manual alert, go to the Help tab and find the Renewal email settings panel at the top.\n\n12. End User Portal\n\nShare this URL with every customer: dockafiplatform.netlify.app/?portal=1\n\nThe portal verifies identity with two factors: email address matching the end user record, and the last 5 digits of the IMEI of the device linked to their account.\n\nAfter verification the customer can submit a suspension or cancellation request. It appears in your Requests queue immediately.\n\n Note: If a customer cannot find their IMEI: search the Device registry by their name and read them the last 5 digits only. Never give the full 15-digit IMEI. \n\n13. Daily Backup\n\nAll platform data backs up automatically to a formatted Excel spreadsheet in your Downloads folder every day at 8:00 PM ET via the dockafi_backup.py Python script running through Windows Task Scheduler.\n\nBackup Contents\n\n Tab Contents \n --- \n Dashboard Live metrics and quick reference URLs \n Devices Full device registry with SIM and end user data \n End Users All end users with linked devices and reseller \n Resellers All organizations with active device counts \n Subscriptions All subscriptions with MRR summary \n Service Requests All suspension and cancellation requests \n Orders All orders with shipping addresses \n\nFiles Created\n\n- DockaFI_Master_Tracker.xlsx — always the latest backup, overwritten each run\n\n- DockaFI_Master_Tracker_YYYY-MM-DD.xlsx — dated archive building up over time\n\nManual Backup\n\nOpen Command Prompt and run: python C:\\DockaFI\\backup\\dockafi_backup.py\n\n14. Editing, Deleting, and Restoring Records\n\nEvery device, end user, and organization record can be edited, deleted, and restored.\n\nEditing\n\nClick the Edit button on any row. Make changes and click Save changes. Changes are written to the database immediately.\n\nSoft Delete\n\nClicking Delete sets the record to deleted status and hides it from normal views. Linked devices are unassigned automatically when an end user or organization is deleted.\n\nShowing Deleted Records\n\nEach panel has a Show deleted checkbox. Check it to reveal deleted records showing a green Restore button.\n\nRestoring\n\nClick Restore to bring a record back. Devices return as Unassigned. End users return as Inactive ready to be re-linked.\n\n15. Quick Reference\n\nKey URLs\n\n Resource URL \n --- \n Admin platform dockafiplatform.netlify.app \n End user portal dockafiplatform.netlify.app/?portal=1 \n Tello account tello.com/account \n Marketing site dockafi.com \n SDS partner page dockafi.com/partners/southeastern-dock-supply \n Dock Depot page dockafi.com/partners/dock-depot \n Supabase database supabase.com \n Stripe dashboard dashboard.stripe.com \n\nCommon Task Workflows\n\n Task Steps \n --- \n New device arrives Add device → enter IMEI → assign reseller org \n New SIM arrives Add SIM → ICCID + activation code → pair to device IMEI \n Order from partner page Orders queue → review → pair SIM → ship → Activate \n New customer (device ready) Add end user → Link device → Activate \n Activate a device Device detail → click Activate button → confirm \n Suspension request Requests → pause in Tello → Mark actioned \n Cancellation request Requests → cancel in Tello → Mark actioned \n Reassign device to new user Edit device → select new end user → Save \n Customer lost IMEI Device registry → search by name → read last 5 digits only \n Move SIM to different device Edit SIM → enter new IMEI → Save \n\nDevice Status Values\n\n Status Meaning \n --- \n Unassigned In inventory, no end user linked \n Active Linked to customer with live subscription \n Suspended Linked but service temporarily paused \n Inactive Previously active, now deactivated \n\nSIM Card Status Values\n\n Status Meaning \n --- \n Unactivated Added to platform, not yet live with Tello \n Active Line confirmed live, data plan running \n Suspended Line paused in Tello \n Deactivated Line permanently cancelled \n\n Tip: For additional help use the AI Help Desk in the platform sidebar. Type any question in plain language and it will guide you through the right process. \n\n	dockafi.com';
 let helpHistory = [];
 
+function localHelpAnswer(question) {
+  const q = (question || '').toLowerCase();
+  const chunks = GUIDE_CONTEXT.split(/\n(?=\d+\. )/);
+  const words = q.split(/[^a-z0-9]+/).filter(w => w.length > 3);
+  let best = '', score = 0;
+  for (const chunk of chunks) {
+    const lower = chunk.toLowerCase();
+    const s = words.reduce((n, w) => n + (lower.includes(w) ? 1 : 0), 0);
+    if (s > score) { score = s; best = chunk.trim(); }
+  }
+  if (score < 1) {
+    return 'I can help with devices, SIMs, linking, orders, requests, and the end-user portal. Click a topic on the left or ask a more specific question.';
+  }
+  return best.length > 1600 ? best.slice(0, 1600) + '\n\nAsk a follow-up if you need the next step.' : best;
+}
+
 function askHelp(question) {
   nav('help');
   setTimeout(() => {
@@ -1883,20 +2060,23 @@ async function sendHelpMessage() {
   document.getElementById('help-send-btn').disabled = true;
   helpHistory.push({role:'user', content: msg});
   try {
-    const res = await fetch('/api/help-assistant', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        system: 'You are the DockaFI platform assistant for AquaEase. Answer questions clearly in plain language based on this guide: ' + GUIDE_CONTEXT,
-        messages: helpHistory
-      })
-    });
-    const data = await res.json();
-    const reply = data.content?.[0]?.text || 'Could not get a response. Please try again.';
+    let reply = '';
+    try {
+      const { res, data } = await requestJson('/api/help-assistant', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          system: 'You are the DockaFI platform assistant for AquaEase. Answer questions clearly in plain language based on this guide: ' + GUIDE_CONTEXT,
+          messages: helpHistory
+        })
+      });
+      if (res.ok) reply = data.content?.[0]?.text || '';
+    } catch (fnErr) { /* fall through to local guide */ }
+    if (!reply) reply = localHelpAnswer(msg);
     helpHistory.push({role:'assistant', content: reply});
     const typingEl = document.getElementById(tid);
     if (typingEl) typingEl.remove();
-    const fmt = reply.replace(/</g,'&lt;').replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\n\n/g,'<br><br>').replace(/\n/g,'<br>');
+    const fmt = esc(reply).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\n\n/g,'<br><br>').replace(/\n/g,'<br>');
     el.innerHTML += '<div class="help-msg-ai"><div class="help-msg-text">' + fmt + '</div></div>';
   } catch(e) {
     const typingEl = document.getElementById(tid);
@@ -1909,7 +2089,7 @@ async function sendHelpMessage() {
 
 async function openEditDevice(serial) {
   try {
-    const rows = await api('/rest/v1/devices?serial_number=eq.' + encodeURIComponent(serial) + '&select=*,organizations!devices_reseller_org_id_fkey(id,name),device_enduser(end_user_id,end_users(id,first_name,last_name))');
+    const rows = await api('/rest/v1/devices?serial_number=eq.' + encodeURIComponent(serial) + '&select=*,organizations!devices_reseller_org_id_fkey(id,name),device_enduser(status,end_user_id,end_users(id,first_name,last_name))');
     const d = rows[0]; if (!d) { toast('Device not found', 'error'); return; }
     document.getElementById('ed-id').value = d.id;
     document.getElementById('ed-serial').value = d.serial_number || '';
@@ -1949,16 +2129,25 @@ async function saveDevice() {
       reseller_org_id: document.getElementById('ed-reseller').value || null,
     })});
     const existing = await api('/rest/v1/device_enduser?device_id=eq.' + id + '&status=eq.active&select=id,end_user_id');
+    async function cancelLinkAndSubs(linkId) {
+      const subs = await api('/rest/v1/subscriptions?device_enduser_id=eq.' + linkId + '&select=id,status');
+      for (const sub of subs) {
+        if (sub.status === 'active') {
+          await api('/rest/v1/subscriptions?id=eq.' + sub.id, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
+        }
+      }
+      await api('/rest/v1/device_enduser?id=eq.' + linkId, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
+    }
     if (euId) {
       if (existing.length && existing[0].end_user_id !== euId) {
-        await api('/rest/v1/device_enduser?id=eq.' + existing[0].id, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
+        await cancelLinkAndSubs(existing[0].id);
         await api('/rest/v1/device_enduser', { method: 'POST', body: JSON.stringify({ device_id: id, end_user_id: euId, status: 'active' }) });
       } else if (!existing.length) {
         await api('/rest/v1/device_enduser', { method: 'POST', body: JSON.stringify({ device_id: id, end_user_id: euId, status: 'active' }) });
         await api('/rest/v1/devices?id=eq.' + id, { method: 'PATCH', body: JSON.stringify({ status: 'active' }) });
       }
     } else if (existing.length) {
-      await api('/rest/v1/device_enduser?id=eq.' + existing[0].id, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
+      await cancelLinkAndSubs(existing[0].id);
       await api('/rest/v1/devices?id=eq.' + id, { method: 'PATCH', body: JSON.stringify({ status: 'unassigned' }) });
     }
     closeModal('modal-edit-device'); toast('Device updated', 'success'); loadDevices();
@@ -1975,8 +2164,6 @@ async function openEditEndUser(id) {
     document.getElementById('eeu-email').value = u.email || '';
     document.getElementById('eeu-phone').value = u.phone || '';
     document.getElementById('eeu-dock').value = u.dock_location || '';
-    document.getElementById('eeu-status').value = u.status || 'active';
-    document.getElementById('eeu-status').value = u.status || 'active';
     document.getElementById('eeu-status').value = u.status || 'active';
     await loadResellersIntoSelect('eeu-reseller');
     document.getElementById('eeu-reseller').value = u.reseller_org_id || '';
@@ -2011,8 +2198,6 @@ async function openEditOrg(id) {
     document.getElementById('eo-contact').value = o.contact_name || '';
     document.getElementById('eo-email').value = o.contact_email || '';
     document.getElementById('eo-phone').value = o.contact_phone || '';
-    document.getElementById('eo-phone').value = o.contact_phone || '';
-    document.getElementById('eo-phone').value = o.contact_phone || '';
     openModal('modal-edit-org');
   } catch(e) { toast('Error loading organization: ' + e.message, 'error'); }
 }
@@ -2043,6 +2228,12 @@ async function softDeleteDevice() {
     // Deactivate any active device_enduser links
     const links = await api('/rest/v1/device_enduser?device_id=eq.' + id + '&status=eq.active&select=id');
     for (const link of links) {
+      const subs = await api('/rest/v1/subscriptions?device_enduser_id=eq.' + link.id + '&select=id,status');
+      for (const sub of subs) {
+        if (sub.status === 'active') {
+          await api('/rest/v1/subscriptions?id=eq.' + sub.id, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
+        }
+      }
       await api('/rest/v1/device_enduser?id=eq.' + link.id, { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) });
     }
     // Soft delete the device
@@ -2096,11 +2287,12 @@ async function softDeleteOrg() {
   if (!confirm('Delete organization ' + name + '? It will be hidden but can be restored.')) return;
   try {
     // Store original type in notes before marking as deleted
-    const rows = await api('/rest/v1/organizations?id=eq.' + id + '&select=type,contact_name');
+    const rows = await api('/rest/v1/organizations?id=eq.' + id + '&select=type,notes');
     const origType = rows[0]?.type || 'reseller';
+    const notes = stripOrgDeletedMark(rows[0]?.notes || '');
     await api('/rest/v1/organizations?id=eq.' + id, {
       method: 'PATCH',
-      body: JSON.stringify({ type: 'deleted', contact_name: (rows[0]?.contact_name || '') + '|orig:' + origType })
+      body: JSON.stringify({ notes: (notes ? notes + '\n' : '') + '[DOCKAFI_DELETED orig:' + origType + ']' })
     });
     closeModal('modal-edit-org');
     toast(name + ' deleted. Toggle "Show deleted" to restore.', 'success');
@@ -2110,15 +2302,15 @@ async function softDeleteOrg() {
 
 async function restoreOrg(id) {
   try {
-    const rows = await api('/rest/v1/organizations?id=eq.' + id + '&select=contact_name');
-    const contactName = rows[0]?.contact_name || '';
-    // Recover original type from contact_name field
-    const origMatch = contactName.match(/\|orig:(\w+)$/);
-    const origType  = origMatch ? origMatch[1] : 'reseller';
-    const cleanName = contactName.replace(/\|orig:\w+$/, '');
+    const rows = await api('/rest/v1/organizations?id=eq.' + id + '&select=notes');
+    const notes = rows[0]?.notes || '';
+    const origMatch = notes.match(ORG_DELETED_RE);
+    const origType = origMatch?.[1];
+    const patch = { notes: stripOrgDeletedMark(notes) || null };
+    if (origType) patch.type = origType;
     await api('/rest/v1/organizations?id=eq.' + id, {
       method: 'PATCH',
-      body: JSON.stringify({ type: origType, contact_name: cleanName })
+      body: JSON.stringify(patch)
     });
     toast('Organization restored.', 'success');
     loadOrgs();
@@ -2146,7 +2338,7 @@ async function addDeviceOrRestore(serial, imei) {
 
 async function loadUnpairedDevicesIntoSelect(selectId, currentDeviceId) {
   // Load devices that have no SIM or are the current device
-  const rows = await api('/rest/v1/devices?select=id,serial_number,imei&order=serial_number&status=neq.deleted');
+  const rows = await api('/rest/v1/devices?select=id,serial_number,imei,status&order=serial_number&status=neq.inactive');
   const sel = document.getElementById(selectId);
   sel.innerHTML = '<option value="">— Unpaired —</option>' +
     rows.map(d => `<option value="${d.id}"${d.id === currentDeviceId ? ' selected' : ''}>${d.serial_number} (${d.imei?.slice(-5)})</option>`).join('');
@@ -2172,7 +2364,7 @@ async function saveSim() {
     let deviceId = null;
     if (imeiInput) {
       if (!/^\d{15}$/.test(imeiInput)) { toast('IMEI must be exactly 15 digits', 'error'); return; }
-      const devRows = await api('/rest/v1/devices?imei=eq.' + imeiInput + '&select=id,status');
+      const devRows = await api('/rest/v1/devices?imei=eq.' + encodeURIComponent(imeiInput) + '&select=id,status');
       if (!devRows.length) { toast('No device found with IMEI ' + imeiInput, 'error'); return; }
       deviceId = devRows[0].id;
     }
@@ -2188,11 +2380,6 @@ async function saveSim() {
         device_id:       deviceId,
       })
     });
-    if (deviceId) {
-      await api('/rest/v1/devices?id=eq.' + deviceId, {
-        method: 'PATCH', body: JSON.stringify({ status: 'active' })
-      });
-    }
     closeModal('modal-add-sim');
     toast('SIM card added' + (deviceId ? ' and paired to device' : ''), 'success');
     loadSims();
@@ -2239,7 +2426,7 @@ async function updateSim() {
     let deviceId = null;
     if (imeiInput) {
       if (!/^\d{15}$/.test(imeiInput)) { toast('IMEI must be exactly 15 digits', 'error'); return; }
-      const devRows = await api('/rest/v1/devices?imei=eq.' + imeiInput + '&select=id');
+      const devRows = await api('/rest/v1/devices?imei=eq.' + encodeURIComponent(imeiInput) + '&select=id');
       if (!devRows.length) { toast('No device found with IMEI ' + imeiInput, 'error'); return; }
       deviceId = devRows[0].id;
     }
@@ -2258,16 +2445,14 @@ async function updateSim() {
         device_id:       deviceId,
         activated_at:    document.getElementById('es-activated-at').value || null,
       })    });
-    // Update device statuses if pairing changed
+    // Unpair only: if the old device has no active end user, return it to inventory
     if (oldDeviceId && oldDeviceId !== deviceId) {
-      await api('/rest/v1/devices?id=eq.' + oldDeviceId, {
-        method: 'PATCH', body: JSON.stringify({ status: 'unassigned' })
-      });
-    }
-    if (deviceId && deviceId !== oldDeviceId) {
-      await api('/rest/v1/devices?id=eq.' + deviceId, {
-        method: 'PATCH', body: JSON.stringify({ status: 'active' })
-      });
+      const links = await api('/rest/v1/device_enduser?device_id=eq.' + oldDeviceId + '&status=eq.active&select=id');
+      if (!links.length) {
+        await api('/rest/v1/devices?id=eq.' + oldDeviceId, {
+          method: 'PATCH', body: JSON.stringify({ status: 'unassigned' })
+        });
+      }
     }
     closeModal('modal-edit-sim');
     toast('SIM card updated', 'success');
@@ -2431,7 +2616,7 @@ async function loadRenewals() {
   }
 }
 
-async function checkAndSendRenewalEmail() {
+async function checkAndSendRenewalEmail(force) {
   const days = getRenewalDays();
   const now = new Date();
   const cutoff = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
@@ -2441,18 +2626,20 @@ async function checkAndSendRenewalEmail() {
 
     const upcoming = subs.filter(s => {
       if (!s.next_billing_date) return false;
-      const d = new Date(s.next_billing_date);
+      const d = new Date(s.next_billing_date + 'T12:00:00');
       return d >= now && d <= cutoff;
     });
 
-    if (!upcoming.length) return;
+    if (!upcoming.length) {
+      if (force) toast('No subscriptions renewing within ' + days + ' days', 'success');
+      return;
+    }
 
-    // Build email body
     const lines = upcoming.map(s => {
       const de = s.device_enduser || {};
       const eu = de.end_users || {};
       const dev = de.devices || {};
-      const renewDate = new Date(s.next_billing_date);
+      const renewDate = new Date(s.next_billing_date + 'T12:00:00');
       const daysOut = Math.ceil((renewDate - now) / (1000 * 60 * 60 * 24));
       return (eu.first_name || '') + ' ' + (eu.last_name || '') +
         ' — ' + (dev.serial_number || '?') +
@@ -2465,15 +2652,18 @@ async function checkAndSendRenewalEmail() {
     const body = 'DockaFI Renewal Alert\n\nThe following subscriptions renew within the next ' + days + ' days:\n\n' +
       lines.join('\n') + '\n\nView details: https://dockafiplatform.netlify.app';
 
-    // Send via Netlify help-assistant endpoint repurposed as email relay
-    // Use mailto fallback for now — opens default email client
-    const mailto = 'mailto:joeamilam@gmail.com?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
     const lastSent = localStorage.getItem('dockafi_renewal_email_sent');
     const today = new Date().toDateString();
-    if (lastSent !== today) {
+    if (!force && lastSent === today) return;
+
+    if (force) {
+      const mailto = 'mailto:' + encodeURIComponent(getRenewalEmail()) + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
       window.open(mailto, '_blank');
       localStorage.setItem('dockafi_renewal_email_sent', today);
       toast('Renewal email opened — ' + upcoming.length + ' subscription' + (upcoming.length === 1 ? '' : 's') + ' due', 'success');
+    } else {
+      localStorage.setItem('dockafi_renewal_email_sent', today);
+      toast(upcoming.length + ' subscription' + (upcoming.length === 1 ? '' : 's') + ' renewing within ' + days + ' days — send from Help if needed', 'success');
     }
   } catch(e) {
     console.warn('Renewal email check failed:', e.message);
@@ -2493,8 +2683,8 @@ function getRenewalEmail() {
 }
 
 async function forceSendRenewalEmail() {
-  localStorage.removeItem('dockafi_renewal_email_sent'); // clear throttle
-  await checkAndSendRenewalEmail();
+  localStorage.removeItem('dockafi_renewal_email_sent');
+  await checkAndSendRenewalEmail(true);
 }
 
 function initHelpRenewalSettings() {
@@ -2709,7 +2899,7 @@ document.addEventListener('keydown', e => {
 });
 
 // ── INIT ──
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
   const url = new URLSearchParams(window.location.search);
   if (url.get('portal') === '1' || window.location.hash === '#portal') {
     showScreen('screen-portal');
@@ -2721,9 +2911,17 @@ window.addEventListener('load', () => {
     const savedEmail = localStorage.getItem('dockafi_email');
     if (saved && savedEmail) {
       const data    = JSON.parse(saved);
-      const payload = JSON.parse(atob(data.access_token.split('.')[1]));
-      if (Date.now() < payload.exp * 1000) {
+      if (Date.now() < jwtExpMs(data.access_token)) {
         SESSION = data;
+        document.getElementById('user-email-display').textContent = savedEmail.split('@')[0];
+        document.getElementById('user-initial').textContent = savedEmail[0].toUpperCase();
+        showScreen('screen-admin');
+        nav('dashboard');
+        return;
+      }
+      // Try refresh before dropping the user on the login screen
+      SESSION = data;
+      if (await ensureSession()) {
         document.getElementById('user-email-display').textContent = savedEmail.split('@')[0];
         document.getElementById('user-initial').textContent = savedEmail[0].toUpperCase();
         showScreen('screen-admin');
@@ -2738,7 +2936,7 @@ window.addEventListener('load', () => {
     localStorage.removeItem('dockafi_email');
   }
   showScreen('screen-auth');
-});;
+});
 </script>
 
 <!-- LINK DEVICE TO END USER MODAL -->
