@@ -1,0 +1,13 @@
+{
+  "name": "dockafi-platform",
+  "private": true,
+  "scripts": {
+    "test": "node scripts/function-smoke-test.js && node scripts/portal-rules-test.js && node scripts/portal-rls-test.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.10.1"
+  },
+  "devDependencies": {
+    "pg": "^8.16.3"
+  }
+}

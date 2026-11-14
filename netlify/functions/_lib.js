@@ -2,8 +2,8 @@
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Cron-Secret',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 };
 
 function json(statusCode, body) {
@@ -57,4 +57,50 @@ async function supabase(path, opts = {}) {
   return data;
 }
 
-module.exports = { CORS, json, options, supabaseEnv, supabase };
+function rawBody(event) {
+  if (!event || event.body == null || event.body === '') return '';
+  if (event.isBase64Encoded) return Buffer.from(event.body, 'base64').toString('utf8');
+  return String(event.body);
+}
+
+function parseBody(event) {
+  const raw = rawBody(event);
+  if (!raw) return {};
+  return JSON.parse(raw);
+}
+
+function bearer(event) {
+  const headers = event && event.headers ? event.headers : {};
+  const raw = headers.authorization || headers.Authorization || '';
+  const match = String(raw).match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function header(event, name) {
+  const headers = event && event.headers ? event.headers : {};
+  const want = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === want) return headers[key];
+  }
+  return '';
+}
+
+class HttpError extends Error {
+  constructor(status, message, extra) {
+    super(message);
+    this.status = status;
+    this.extra = extra || null;
+  }
+}
+
+function fail(error) {
+  const status = error.status || (error.code === 'NO_KEY' || error.code === 'NO_SERVICE' ? 501 : 500);
+  const body = { error: error.message || 'Request failed' };
+  if (error.extra && typeof error.extra === 'object') Object.assign(body, error.extra);
+  return json(status, body);
+}
+
+module.exports = {
+  CORS, json, options, supabaseEnv, supabase,
+  rawBody, parseBody, bearer, header, HttpError, fail,
+};
