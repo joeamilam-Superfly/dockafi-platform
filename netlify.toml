@@ -8,6 +8,11 @@
 [functions]
   node_bundler = "esbuild"
 
+# Daily coverage warnings and 6-month auto-cancel. UTC 13:00 is morning US Eastern.
+# Scheduled functions run on published deploys. Run now works on a deploy preview.
+[functions."coverage-schedule"]
+  schedule = "0 13 * * *"
+
 # Route /api/* → /.netlify/functions/*
 [[redirects]]
   from = "/api/*"

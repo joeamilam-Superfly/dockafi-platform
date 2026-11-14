@@ -3,6 +3,11 @@
 const assert = require('assert');
 const submit = require('../netlify/functions/submit-request');
 const help = require('../netlify/functions/help-assistant');
+const account = require('../netlify/functions/portal-account');
+const action = require('../netlify/functions/portal-action');
+const recover = require('../netlify/functions/portal-recover');
+const admin = require('../netlify/functions/customer-admin');
+const schedule = require('../netlify/functions/coverage-schedule');
 
 async function run() {
   const optSubmit = await submit.handler({ httpMethod: 'OPTIONS' });
@@ -34,6 +39,31 @@ async function run() {
   const parsed = JSON.parse(helpReply.body);
   assert.ok(parsed.content?.[0]?.text);
   assert.match(parsed.content[0].text, /device/i);
+
+  const optAccount = await account.handler({ httpMethod: 'OPTIONS', headers: {} });
+  assert.strictEqual(optAccount.statusCode, 204);
+
+  const noAccount = await account.handler({ httpMethod: 'GET', headers: {} });
+  assert.strictEqual(noAccount.statusCode, 401);
+
+  const noAction = await action.handler({ httpMethod: 'POST', headers: {}, body: '{}' });
+  assert.strictEqual(noAction.statusCode, 401);
+
+  const badRecover = await recover.handler({ httpMethod: 'POST', headers: {}, body: '{"email":"nope"}' });
+  assert.strictEqual(badRecover.statusCode, 400);
+
+  const unconfigured = await recover.handler({
+    httpMethod: 'POST',
+    headers: {},
+    body: JSON.stringify({ email: 'customer@example.com' }),
+  });
+  assert.strictEqual(unconfigured.statusCode, 503);
+
+  const noAdmin = await admin.handler({ httpMethod: 'POST', headers: {}, body: '{"action":"invite"}' });
+  assert.strictEqual(noAdmin.statusCode, 401);
+
+  const noSchedule = await schedule.handler({ httpMethod: 'POST', headers: {}, body: '{}' });
+  assert.strictEqual(noSchedule.statusCode, 401);
 
   console.log('function smoke tests ok');
 }
