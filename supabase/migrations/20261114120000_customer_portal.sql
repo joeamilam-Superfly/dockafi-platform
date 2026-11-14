@@ -213,7 +213,7 @@ grant insert on table public.orders_queue to anon;
 
 create table if not exists public.email_drafts (
   id uuid primary key default gen_random_uuid(),
-  from_address text not null default 'support@dockafi.com',
+  from_address text not null default 'aquaease.creations@gmail.com',
   to_email text not null,
   subject text not null,
   body_text text not null,
@@ -467,7 +467,7 @@ begin
     'Cancel means a new SIM card has to be shipped before service can start again.';
 
   insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
-  values ('support@dockafi.com', v_admin, v_subject, v_body, 'tello_change', v_eu.id, p_device)
+  values ('aquaease.creations@gmail.com', v_admin, v_subject, v_body, 'tello_change', v_eu.id, p_device)
   returning id into v_draft;
 
   return jsonb_build_object(
@@ -651,7 +651,7 @@ begin
 
       insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
       values (
-        'support@dockafi.com',
+        'aquaease.creations@gmail.com',
         v_admin,
         'DockaFi auto-cancel: deactivate Tello SIM for ' || v_name,
         'Suspended coverage reached the 6-month limit and was canceled in the platform.' || E'\n\n' ||
@@ -668,7 +668,7 @@ begin
       );
       insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
       values (
-        'support@dockafi.com',
+        'aquaease.creations@gmail.com',
         v_row.email,
         'Your DockaFi coverage was canceled',
         'Your DockaFi coverage was canceled because it stayed suspended through ' ||
@@ -699,7 +699,7 @@ begin
 
     insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
     values (
-      'support@dockafi.com',
+      'aquaease.creations@gmail.com',
       v_row.email,
       'DockaFi coverage cancels on ' || to_char(v_row.auto_cancel_on, 'FMMonth FMDD, YYYY'),
       'Your DockaFi coverage is suspended and is set to cancel on ' ||
@@ -919,7 +919,7 @@ begin
   ) then
     insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
     values (
-      'support@dockafi.com',
+      'aquaease.creations@gmail.com',
       'brendenmilstead@yahoo.com',
       'Your DockaFi customer portal login',
       'Hi Brenden,' || E'\n\n' ||

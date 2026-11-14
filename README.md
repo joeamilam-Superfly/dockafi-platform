@@ -52,7 +52,7 @@ Customers sign in at `/?portal=1` with email and password. They see their name, 
 
 New customer accounts use the starting password in `PORTAL_DEFAULT_PASSWORD` (default `Dockafi1234`). The welcome draft includes the login URL, email, and that password. After sign-in the portal asks them to change it and keeps asking until they do. Skipping it does not lock the page. Forgot password and Resend password email save a recovery-link draft. Those links last about an hour. Email drafts can regenerate one.
 
-Nothing is emailed automatically. Drafts live in `email_drafts` and show under Email drafts, with a count of unsent drafts. An operator copies the body or opens it in a mail app and sends it from support@dockafi.com, then marks it sent or discards it. Set `PORTAL_SEND_EMAIL=true` only if Resend or SMTP is also configured and that send path should be on.
+Nothing is emailed automatically. Drafts live in `email_drafts` and show under Email drafts, with a count of unsent drafts. An operator copies the body or opens it in a mail app and sends it from aquaease.creations@gmail.com, then marks it sent or discards it. `PORTAL_FROM_EMAIL` overrides that sender for drafts the Netlify functions save. Coverage drafts written in the database use the `email_drafts.from_address` default, which is the same address. Set `PORTAL_SEND_EMAIL=true` only if Resend or SMTP is also configured and that send path should be on.
 
 The daily Netlify function `coverage-schedule` (13:00 UTC) saves warning drafts 30, 7, and 1 days before auto-cancel, then cancels the line and saves the operator and customer drafts. It runs on the published production deploy. A deploy preview can use the Netlify **Run now** button, or an operator session can POST `/api/customer-admin` with `{ "action": "run_schedule" }`.
 
@@ -77,6 +77,7 @@ SUPABASE_ANON_KEY
 SUPABASE_SERVICE_ROLE_KEY
 # optional:
 PORTAL_DEFAULT_PASSWORD
+PORTAL_FROM_EMAIL
 PORTAL_SITE_URL
 CRON_SECRET
 ADMIN_NOTIFY_EMAIL
@@ -86,7 +87,7 @@ ANTHROPIC_API_KEY
 
 ## After merge (do not apply before approval)
 
-1. In the Supabase SQL editor, or with the CLI, apply `supabase/migrations/20261114120000_customer_portal.sql` to project `ldgbghjjzbhtrgdnmlmv`.
+1. In the Supabase SQL editor, or with the CLI, apply `supabase/migrations/20261114120000_customer_portal.sql` to project `ldgbghjjzbhtrgdnmlmv`, then `supabase/migrations/20261114160000_portal_from_email.sql`. The second migration sets the draft sender default to aquaease.creations@gmail.com and updates any function or draft still using the old address. It is safe if that default is already in place.
 2. Confirm `user_roles` has admin rows for Joe and Heath. Confirm Brenden has an end user, an active device link, a subscription, an Auth user with password `Dockafi1234` and `must_change_password`, and one welcome draft. No email is sent.
 3. Set the Netlify env vars above and redeploy so the functions pick them up.
 4. In Supabase Auth → Sign In / Providers, turn off **Allow new users to sign up**. The migration trigger already blocks public signup; this makes the API error clearer.

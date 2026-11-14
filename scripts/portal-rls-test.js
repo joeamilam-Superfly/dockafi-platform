@@ -236,7 +236,7 @@ async function main() {
   const drafts = await db.query(
     `select kind, from_address, to_email, body_text from email_drafts where kind = 'tello_change'`
   );
-  assert.ok(drafts.rows.some((row) => row.to_email === 'ops@example.com' && row.from_address === 'support@dockafi.com'));
+  assert.ok(drafts.rows.some((row) => row.to_email === 'ops@example.com' && row.from_address === 'aquaease.creations@gmail.com'));
   assert.ok(drafts.rows.every((row) => !row.body_text.includes('$')));
 
   const reactivated = await asRole(db, 'service_role', null, async () => {
@@ -261,7 +261,7 @@ async function main() {
     `select to_email, from_address, body_text from email_drafts where kind = 'warning'`
   );
   assert.strictEqual(warning.rows[0].to_email, 'ada@example.com');
-  assert.strictEqual(warning.rows[0].from_address, 'support@dockafi.com');
+  assert.strictEqual(warning.rows[0].from_address, 'aquaease.creations@gmail.com');
   assert.match(warning.rows[0].body_text, /7 days/);
   assert.ok(!warning.rows[0].body_text.includes('$'));
 
@@ -392,7 +392,7 @@ async function main() {
     where kind = 'welcome' and lower(to_email) = 'brendenmilstead@yahoo.com'
   `);
   assert.strictEqual(welcome.rows.length, 1);
-  assert.strictEqual(welcome.rows[0].from_address, 'support@dockafi.com');
+  assert.strictEqual(welcome.rows[0].from_address, 'aquaease.creations@gmail.com');
   assert.match(welcome.rows[0].body_text, /Dockafi1234/);
   assert.ok(!welcome.rows[0].body_text.includes('$'));
   const identity = await db.query(`
@@ -423,6 +423,27 @@ async function main() {
     }
   });
   assert.strictEqual(anonDrafts, 0);
+
+  await db.query(`
+    insert into email_drafts (from_address, to_email, subject, body_text, kind)
+    values ('support@dockafi.com', 'old@example.com', 'Old sender', 'body', 'welcome');
+    create or replace function public.portal_from_probe() returns text
+    language sql as $$ select 'support@dockafi.com'::text $$;
+  `);
+  const fromEmailSql = fs.readFileSync(path.join(root, 'supabase/migrations/20261114160000_portal_from_email.sql'), 'utf8');
+  await db.query(fromEmailSql);
+  await db.query(fromEmailSql);
+  const senderDefault = await db.query(`
+    select column_default from information_schema.columns
+    where table_schema = 'public' and table_name = 'email_drafts' and column_name = 'from_address'
+  `);
+  assert.match(senderDefault.rows[0].column_default, /aquaease\.creations@gmail\.com/);
+  const rewritten = await db.query(`select public.portal_from_probe() as sender`);
+  assert.strictEqual(rewritten.rows[0].sender, 'aquaease.creations@gmail.com');
+  const leftover = await db.query(`select from_address from email_drafts where to_email = 'old@example.com'`);
+  assert.strictEqual(leftover.rows[0].from_address, 'aquaease.creations@gmail.com');
+  const stillOld = await db.query(`select count(*)::int as n from email_drafts where from_address = 'support@dockafi.com'`);
+  assert.strictEqual(stillOld.rows[0].n, 0);
 
   await db.end();
   console.log('portal rls tests ok');
