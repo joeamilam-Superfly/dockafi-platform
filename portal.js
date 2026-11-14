@@ -61,6 +61,7 @@ function showAdminShell(email) {
   if (initEl && shown) initEl.textContent = shown[0].toUpperCase();
   showScreen('screen-admin');
   nav('dashboard');
+  if (window.refreshDraftBadge) window.refreshDraftBadge();
 }
 
 function logoSrc() {
@@ -73,16 +74,19 @@ function portalErrorBox(message) {
   return '<div class="auth-err" style="display:block;">' + esc(message) + '</div>';
 }
 
-function renderPortalLogin(message) {
+function renderPortalLogin(message, tone) {
   showPortalFrame();
   window.SESSION_ROLE = window.SESSION_ROLE === 'admin' ? 'admin' : null;
   var root = portalMount();
+  var note = '';
+  if (message && tone === 'ok') note = '<div class="cust-banner">' + esc(message) + '</div>';
+  else note = portalErrorBox(message);
   root.innerHTML =
     '<div class="cust-page center"><div class="cust-login"><div class="cust-card">' +
       '<img class="cust-logo" alt="DockaFi" src="' + logoSrc() + '">' +
       '<div class="cust-kicker">DockaFi Customer Portal</div>' +
       '<div class="cust-title">Sign in to your account</div>' +
-      portalErrorBox(message) +
+      note +
       '<div class="form-group"><label class="form-label">Email</label>' +
         '<input class="form-control" id="portal-email" type="email" autocomplete="username"></div>' +
       '<div class="form-group"><label class="form-label">Password</label>' +
@@ -218,7 +222,7 @@ async function sendForgot() {
       method: 'POST',
       body: JSON.stringify({ email: email })
     });
-    renderPortalLogin('If that email has a portal login, a reset link is on its way.');
+    renderPortalLogin('A reset email is on its way.', 'ok');
   } catch (err) {
     renderForgot(err.message);
   }
@@ -253,6 +257,12 @@ async function saveNewPassword() {
       token_type: 'bearer'
     }, email);
     PORTAL_RECOVERY = null;
+    try {
+      await portalFetch('/api/portal-password', {
+        method: 'POST',
+        body: JSON.stringify({ password: pass })
+      });
+    } catch (ignore) { /* the password is already saved */ }
     await routeAfterAuth(email, true);
   } catch (err) {
     renderSetPassword(err.message);
@@ -316,13 +326,55 @@ function renderAccount(account) {
     '<div class="cust-page"><div class="cust-shell">' +
       '<div class="cust-top"><div><div class="cust-brand">DockaFI</div><div class="cust-brand-sub">DockaFi Customer Portal</div></div>' +
       '<button class="btn" type="button" id="portal-signout"><i class="ti ti-logout"></i> Sign out</button></div>' +
+      passwordPanel(account) +
       cards +
       '<div id="cust-modal-host"></div>' +
     '</div></div>';
   document.getElementById('portal-signout').onclick = signOut;
+  var save = document.getElementById('acct-pass-save');
+  if (save) save.onclick = function () { saveAccountPassword(account); };
   portalMount().querySelectorAll('[data-act]').forEach(function (button) {
     button.onclick = function () { openCoverageModal(account, button.getAttribute('data-act'), button.getAttribute('data-device')); };
   });
+}
+
+function passwordPanel(account) {
+  var banner = account && account.must_change_password
+    ? '<div class="cust-banner">Please change your password. You can keep using the portal until you do.</div>'
+    : '';
+  return banner +
+    '<div class="cust-card" style="margin-bottom:16px;">' +
+      '<div class="cust-eyebrow">' + (account && account.must_change_password ? 'Please change your password' : 'Change password') + '</div>' +
+      '<div id="pw-error" class="auth-err"></div>' +
+      '<div class="form-group"><label class="form-label">New password</label>' +
+        '<input class="form-control" id="acct-pass" type="password" autocomplete="new-password"></div>' +
+      '<div class="form-group"><label class="form-label">Confirm password</label>' +
+        '<input class="form-control" id="acct-pass2" type="password" autocomplete="new-password"></div>' +
+      '<button class="btn btn-primary" id="acct-pass-save" type="button">Change password</button>' +
+    '</div>';
+}
+
+async function saveAccountPassword(account) {
+  var pass = document.getElementById('acct-pass').value;
+  var pass2 = document.getElementById('acct-pass2').value;
+  var err = document.getElementById('pw-error');
+  err.style.display = 'none';
+  if (pass.length < 8) { err.style.display = 'block'; err.textContent = 'Use at least 8 characters.'; return; }
+  if (pass !== pass2) { err.style.display = 'block'; err.textContent = 'Those passwords do not match.'; return; }
+  document.getElementById('acct-pass-save').disabled = true;
+  try {
+    await portalFetch('/api/portal-password', {
+      method: 'POST',
+      body: JSON.stringify({ password: pass })
+    });
+    toast('Password updated', 'success');
+    account.must_change_password = false;
+    renderAccount(account);
+  } catch (e) {
+    err.style.display = 'block';
+    err.textContent = e.message;
+    document.getElementById('acct-pass-save').disabled = false;
+  }
 }
 
 function openCoverageModal(account, action, deviceId) {
@@ -429,8 +481,8 @@ async function bootDockafi() {
 
 function portalAccessBadge(user) {
   if (!user) return '';
-  if (user.portal_activated_at) return '<span class="badge badge-active">Ready</span>';
-  if (user.portal_invited_at || user.auth_user_id) return '<span class="badge invite-sent">Invite sent</span>';
+  if (user.auth_user_id) return '<span class="badge badge-active">Login ready</span>';
+  if (user.portal_invited_at) return '<span class="badge invite-sent">Invite sent</span>';
   return '<span class="badge badge-inactive">Not invited</span>';
 }
 
@@ -497,7 +549,7 @@ function ensureNewCustomerModal() {
   wrap.id = 'modal-new-customer';
   wrap.innerHTML =
     '<div class="modal"><div class="modal-title">New customer account</div>' +
-    '<div class="cust-banner">Saving this account will email the customer a link to set their portal password. They will sign in at the customer portal with that email.</div>' +
+    '<div class="cust-banner">This creates the login with the starting password and saves a welcome email in Email drafts for you to send.</div>' +
     '<div id="nc-error" class="auth-err"></div>' +
     '<div class="form-grid"><div class="form-group"><label class="form-label">First name</label><input class="form-control" id="nc-first"></div>' +
     '<div class="form-group"><label class="form-label">Last name</label><input class="form-control" id="nc-last"></div>' +
@@ -508,7 +560,7 @@ function ensureNewCustomerModal() {
     '<div id="nc-link" class="cust-linkbox" style="display:none;"></div>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">' +
     '<button class="btn" type="button" onclick="closeModal(\'modal-new-customer\')">Cancel</button>' +
-    '<button class="btn btn-primary" id="nc-save" type="button" onclick="submitNewCustomer()"><i class="ti ti-mail"></i> Create account and send invite</button>' +
+    '<button class="btn btn-primary" id="nc-save" type="button" onclick="submitNewCustomer()"><i class="ti ti-user-plus"></i> Create account</button>' +
     '</div></div>';
   document.body.appendChild(wrap);
 }
@@ -545,16 +597,10 @@ async function submitNewCustomer() {
         imei: document.getElementById('nc-imei').value.trim()
       })
     });
-    if (data.setup_link) {
-      link.style.display = 'block';
-      link.textContent = data.setup_link;
-      err.style.display = 'block';
-      err.textContent = data.reason || 'Email is not configured, so the setup link is shown here for the operator only.';
-    } else {
-      closeModal('modal-new-customer');
-      toast('Invite email sent', 'success');
-    }
+    closeModal('modal-new-customer');
+    toast('Account created. The welcome email is in Email drafts.', 'success');
     if (typeof loadEndUsers === 'function') loadEndUsers();
+    if (window.refreshDraftBadge) window.refreshDraftBadge();
   } catch (e) {
     err.style.display = 'block';
     err.textContent = e.message;
@@ -564,20 +610,136 @@ async function submitNewCustomer() {
 
 async function resendPortalEmail(id) {
   try {
-    var data = await portalFetch('/api/customer-admin', {
+    await portalFetch('/api/customer-admin', {
       method: 'POST',
       body: JSON.stringify({ action: 'resend', end_user_id: id })
     });
-    if (data.setup_link) {
-      window.prompt('Email is not configured. Copy this one-time setup link:', data.setup_link);
-    } else {
-      toast('Password email sent', 'success');
-    }
+    toast('Password email saved in Email drafts.', 'success');
     loadEndUsers();
+    if (window.refreshDraftBadge) window.refreshDraftBadge();
   } catch (err) {
     toast(err.message, 'error');
   }
 }
+
+function mailtoFor(row) {
+  return 'mailto:' + row.to_email +
+    '?subject=' + encodeURIComponent(row.subject || '') +
+    '&body=' + encodeURIComponent(row.body_text || '');
+}
+
+async function copyDraft(id) {
+  var row = (window.EMAIL_DRAFTS || {})[id];
+  if (!row) return;
+  try {
+    await navigator.clipboard.writeText(row.body_text || '');
+    toast('Copied', 'success');
+  } catch (err) {
+    window.prompt('Copy this email body:', row.body_text || '');
+  }
+}
+
+async function setDraftStatus(id, status) {
+  try {
+    var patch = { status: status };
+    if (status === 'sent') {
+      patch.sent_at = new Date().toISOString();
+      patch.sent_by = localStorage.getItem('dockafi_email') || 'operator';
+    }
+    await api('/rest/v1/email_drafts?id=eq.' + encodeURIComponent(id), {
+      method: 'PATCH',
+      body: JSON.stringify(patch)
+    });
+    toast(status === 'sent' ? 'Marked as sent' : 'Discarded', 'success');
+    window.loadEmailDrafts();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function regenerateDraft(id) {
+  try {
+    await portalFetch('/api/customer-admin', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'regenerate', draft_id: id })
+    });
+    toast('Link regenerated. Send this draft soon. The link lasts about an hour.', 'success');
+    window.loadEmailDrafts();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+window.refreshDraftBadge = async function () {
+  var badge = document.getElementById('drafts-badge');
+  if (!badge || !SESSION) return;
+  try {
+    var rows = await api('/rest/v1/email_drafts?status=eq.draft&select=id');
+    if (rows && rows.length) {
+      badge.textContent = String(rows.length);
+      badge.style.display = 'inline';
+    } else {
+      badge.style.display = 'none';
+    }
+  } catch (err) {
+    badge.style.display = 'none';
+  }
+};
+
+window.loadEmailDrafts = async function () {
+  var host = document.getElementById('drafts-list');
+  if (!host) return;
+  host.innerHTML = '<div class="card"><div class="loading"><div class="spinner"></div>Loading...</div></div>';
+  try {
+    var rows = await api('/rest/v1/email_drafts?select=*&order=created_at.desc');
+    window.refreshDraftBadge();
+    if (!rows || !rows.length) {
+      host.innerHTML = '<div class="card"><div class="empty"><i class="ti ti-mail"></i>No email drafts</div></div>';
+      return;
+    }
+    window.EMAIL_DRAFTS = {};
+    rows.forEach(function (row) { window.EMAIL_DRAFTS[row.id] = row; });
+    host.innerHTML = rows.map(function (row) {
+      var when = row.created_at ? new Date(row.created_at).toLocaleString() : '';
+      var badge = row.status === 'draft' ? 'badge-pending' : (row.status === 'sent' ? 'badge-active' : 'badge-inactive');
+      var regen = row.kind === 'password_reset'
+        ? '<button class="btn btn-sm" type="button" data-draft-regen="' + row.id + '">Regenerate link</button>'
+        : '';
+      return '<div class="card" style="margin-bottom:12px;">' +
+        '<div class="card-header"><span class="card-title">' + esc(row.subject) + '</span>' +
+        '<span class="badge ' + badge + '">' + esc(row.status) + '</span></div>' +
+        '<div style="font-size:12px;color:var(--text3);margin-bottom:8px;">' +
+          esc(row.kind) + ' · ' + esc(row.from_address) + ' → ' + esc(row.to_email) + ' · ' + esc(when) +
+        '</div>' +
+        '<pre class="draft-body">' + esc(row.body_text) + '</pre>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
+          '<button class="btn btn-sm" type="button" data-draft-copy="' + row.id + '">Copy body</button>' +
+          '<a class="btn btn-sm" data-draft-mail="' + row.id + '">Open in mail app</a>' +
+          '<button class="btn btn-sm" type="button" data-draft-sent="' + row.id + '">Mark as sent</button>' +
+          '<button class="btn btn-sm" type="button" data-draft-discard="' + row.id + '">Discard</button>' +
+          regen +
+        '</div></div>';
+    }).join('');
+    host.querySelectorAll('[data-draft-copy]').forEach(function (btn) {
+      btn.onclick = function () { copyDraft(btn.getAttribute('data-draft-copy')); };
+    });
+    host.querySelectorAll('[data-draft-mail]').forEach(function (btn) {
+      var row = window.EMAIL_DRAFTS[btn.getAttribute('data-draft-mail')];
+      if (row) btn.href = mailtoFor(row);
+    });
+    host.querySelectorAll('[data-draft-sent]').forEach(function (btn) {
+      btn.onclick = function () { setDraftStatus(btn.getAttribute('data-draft-sent'), 'sent'); };
+    });
+    host.querySelectorAll('[data-draft-discard]').forEach(function (btn) {
+      btn.onclick = function () { setDraftStatus(btn.getAttribute('data-draft-discard'), 'discarded'); };
+    });
+    host.querySelectorAll('[data-draft-regen]').forEach(function (btn) {
+      btn.onclick = function () { regenerateDraft(btn.getAttribute('data-draft-regen')); };
+    });
+  } catch (err) {
+    host.innerHTML = '<div class="card" style="color:var(--red);padding:16px;">' + esc(err.message) + '</div>';
+  }
+};
 
 window.bootDockafi = bootDockafi;
 window.openNewCustomer = openNewCustomer;

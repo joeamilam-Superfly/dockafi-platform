@@ -57,7 +57,7 @@ async function run() {
     headers: {},
     body: JSON.stringify({ email: 'customer@example.com' }),
   });
-  assert.strictEqual(unconfigured.statusCode, 503);
+  assert.strictEqual(unconfigured.statusCode, 501);
 
   const noAdmin = await admin.handler({ httpMethod: 'POST', headers: {}, body: '{"action":"invite"}' });
   assert.strictEqual(noAdmin.statusCode, 401);

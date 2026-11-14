@@ -233,8 +233,11 @@ async function main() {
   const requests = await db.query(`select request_type, status from service_requests where device_id = $1`, [deviceA]);
   assert.strictEqual(requests.rows[0].request_type, 'suspend');
   assert.strictEqual(requests.rows[0].status, 'new');
-  const outbox = await db.query(`select kind, to_email from coverage_email_outbox where subscription_id is not null`);
-  assert.ok(outbox.rows.some((row) => row.kind === 'admin_action' && row.to_email === 'ops@example.com'));
+  const drafts = await db.query(
+    `select kind, from_address, to_email, body_text from email_drafts where kind = 'tello_change'`
+  );
+  assert.ok(drafts.rows.some((row) => row.to_email === 'ops@example.com' && row.from_address === 'support@dockafi.com'));
+  assert.ok(drafts.rows.every((row) => !row.body_text.includes('$')));
 
   const reactivated = await asRole(db, 'service_role', null, async () => {
     return (await q(db,
@@ -254,9 +257,13 @@ async function main() {
   }, true);
   assert.strictEqual(Number(warned.warnings), 1);
   assert.strictEqual(Number(warned.cancellations), 0);
-  const warning = await db.query(`select warning_slot, to_email from coverage_email_outbox where kind = 'warning'`);
-  assert.strictEqual(warning.rows[0].warning_slot, 7);
+  const warning = await db.query(
+    `select to_email, from_address, body_text from email_drafts where kind = 'warning'`
+  );
   assert.strictEqual(warning.rows[0].to_email, 'ada@example.com');
+  assert.strictEqual(warning.rows[0].from_address, 'support@dockafi.com');
+  assert.match(warning.rows[0].body_text, /7 days/);
+  assert.ok(!warning.rows[0].body_text.includes('$'));
 
   await db.query(`update subscriptions set auto_cancel_on = (timezone('America/New_York', now()))::date - 1 where device_enduser_id = $1`, [linkA]);
   const canceled = await asRole(db, 'service_role', null, async () => {
@@ -296,6 +303,8 @@ async function main() {
   assert.strictEqual(snap.devices.length, 1);
   assert.strictEqual(snap.devices[0].imei, '222222222222222');
   assert.ok(!JSON.stringify(snap).includes('SECRET-CODE'));
+  assert.ok(!JSON.stringify(snap).includes('monthly_amount'));
+  assert.strictEqual(snap.must_change_password, false);
 
   const brendenDevice = '9b5f038d-009f-4d49-a976-d5422621fef9';
   await db.query(
@@ -313,6 +322,32 @@ async function main() {
     `insert into device_enduser (device_id, end_user_id, status) values ($1, $2, 'cancelled'), ($1, $2, 'cancelled')`,
     [brendenDevice, craig]
   );
+  await db.query(`
+    alter table auth.users
+      add column if not exists instance_id uuid,
+      add column if not exists aud text,
+      add column if not exists role text,
+      add column if not exists encrypted_password text,
+      add column if not exists email_confirmed_at timestamptz,
+      add column if not exists raw_user_meta_data jsonb,
+      add column if not exists updated_at timestamptz,
+      add column if not exists confirmation_token text,
+      add column if not exists recovery_token text,
+      add column if not exists email_change_token_new text,
+      add column if not exists email_change text,
+      add column if not exists is_sso_user boolean not null default false,
+      add column if not exists is_anonymous boolean not null default false;
+    create table if not exists auth.identities (
+      id uuid primary key default gen_random_uuid(),
+      provider_id text,
+      user_id uuid,
+      identity_data jsonb,
+      provider text,
+      email text,
+      created_at timestamptz,
+      updated_at timestamptz
+    );
+  `);
   const migration = fs.readFileSync(path.join(root, 'supabase/migrations/20261114120000_customer_portal.sql'), 'utf8');
   const seedSql = migration.slice(migration.indexOf('-- Brenden Milstead'));
   await db.query(seedSql);
@@ -336,8 +371,58 @@ async function main() {
   );
   assert.strictEqual(seededSub.rows[0].plan_name, '50 GB Monthly');
   assert.strictEqual(seededSub.rows[0].status, 'active');
-  const brendenAuth = await db.query(`select id from auth.users where lower(email) = 'brendenmilstead@yahoo.com'`);
-  assert.strictEqual(brendenAuth.rows.length, 0);
+  const brendenAuth = await db.query(`
+    select (encrypted_password = crypt('Dockafi1234', encrypted_password)) as password_ok,
+           email_confirmed_at is not null as confirmed,
+           raw_app_meta_data->>'role' as role
+    from auth.users where lower(email) = 'brendenmilstead@yahoo.com'
+  `);
+  assert.strictEqual(brendenAuth.rows.length, 1);
+  assert.strictEqual(brendenAuth.rows[0].password_ok, true);
+  assert.strictEqual(brendenAuth.rows[0].confirmed, true);
+  assert.strictEqual(brendenAuth.rows[0].role, 'customer');
+  const brendenProfile = await db.query(`
+    select must_change_password, auth_user_id is not null as linked
+    from end_users where lower(email) = 'brendenmilstead@yahoo.com'
+  `);
+  assert.strictEqual(brendenProfile.rows[0].must_change_password, true);
+  assert.strictEqual(brendenProfile.rows[0].linked, true);
+  const welcome = await db.query(`
+    select from_address, body_text from email_drafts
+    where kind = 'welcome' and lower(to_email) = 'brendenmilstead@yahoo.com'
+  `);
+  assert.strictEqual(welcome.rows.length, 1);
+  assert.strictEqual(welcome.rows[0].from_address, 'support@dockafi.com');
+  assert.match(welcome.rows[0].body_text, /Dockafi1234/);
+  assert.ok(!welcome.rows[0].body_text.includes('$'));
+  const identity = await db.query(`
+    select count(*)::int as n from auth.identities i
+    join auth.users u on u.id = i.user_id
+    where lower(u.email) = 'brendenmilstead@yahoo.com' and i.provider = 'email'
+  `);
+  assert.strictEqual(identity.rows[0].n, 1);
+
+  const customerDrafts = await asRole(db, 'authenticated', customerA, async () => {
+    return (await q(db, 'select id from email_drafts')).rows.length;
+  });
+  assert.strictEqual(customerDrafts, 0);
+  const adminDrafts = await asRole(db, 'authenticated', joe, async () => {
+    return (await q(db, 'select id from email_drafts')).rows.length;
+  });
+  assert.ok(adminDrafts > 0);
+  const anonDrafts = await asRole(db, 'anon', null, async () => {
+    await q(db, 'savepoint anon_probe');
+    try {
+      const rows = await q(db, 'select id from email_drafts');
+      await q(db, 'release savepoint anon_probe');
+      return rows.rows.length;
+    } catch (err) {
+      await q(db, 'rollback to savepoint anon_probe');
+      if (/permission denied/i.test(err.message)) return 0;
+      throw err;
+    }
+  });
+  assert.strictEqual(anonDrafts, 0);
 
   await db.end();
   console.log('portal rls tests ok');

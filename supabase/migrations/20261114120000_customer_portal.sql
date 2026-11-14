@@ -2,7 +2,8 @@
 -- Operators: joeamilam@gmail.com, heath@isomelectric.com.
 -- Customers read only their own rows. Coverage changes go through
 -- private.apply_customer_coverage, called by the Netlify service role.
--- Does not create an Auth user for Brenden Milstead and does not send email.
+-- Brenden's login is created with the default password Dockafi1234.
+-- Portal mail is stored in email_drafts. Nothing is sent automatically.
 
 create schema if not exists private;
 revoke all on schema private from public;
@@ -15,7 +16,8 @@ grant usage on schema private to service_role, authenticated;
 alter table public.end_users
   add column if not exists auth_user_id uuid unique references auth.users (id) on delete set null,
   add column if not exists portal_invited_at timestamptz,
-  add column if not exists portal_activated_at timestamptz;
+  add column if not exists portal_activated_at timestamptz,
+  add column if not exists must_change_password boolean not null default false;
 
 alter table public.subscriptions
   add column if not exists suspended_at timestamptz,
@@ -206,35 +208,45 @@ revoke all on table public.orders_queue from anon;
 grant insert on table public.orders_queue to anon;
 
 -- ---------------------------------------------------------------------------
--- Mail queue. Service role inserts. Operators can read. No anon access.
+-- Email drafts. Nothing is sent until an operator marks it sent.
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.coverage_email_outbox (
+create table if not exists public.email_drafts (
   id uuid primary key default gen_random_uuid(),
-  kind text not null check (kind = any (array['admin_action'::text, 'warning'::text, 'auto_cancel'::text, 'customer_notice'::text])),
+  from_address text not null default 'support@dockafi.com',
   to_email text not null,
   subject text not null,
   body_text text not null,
-  subscription_id uuid,
-  warning_slot integer,
+  kind text not null check (kind = any (array[
+    'welcome'::text, 'password_reset'::text, 'tello_change'::text,
+    'warning'::text, 'auto_cancel'::text, 'customer_notice'::text
+  ])),
+  end_user_id uuid references public.end_users (id) on delete set null,
+  device_id uuid references public.devices (id) on delete set null,
   created_at timestamptz not null default now(),
-  sent_at timestamptz
+  status text not null default 'draft' check (status = any (array['draft'::text, 'sent'::text, 'discarded'::text])),
+  sent_at timestamptz,
+  sent_by text
 );
 
-alter table public.coverage_email_outbox enable row level security;
+alter table public.email_drafts enable row level security;
 
-revoke all on table public.coverage_email_outbox from public, anon, authenticated;
-grant select on table public.coverage_email_outbox to authenticated;
-grant select, insert, update, delete on table public.coverage_email_outbox to service_role;
+revoke all on table public.email_drafts from public, anon, authenticated;
+grant select, update on table public.email_drafts to authenticated;
+grant select, insert, update, delete on table public.email_drafts to service_role;
 
-drop policy if exists admin_read_outbox on public.coverage_email_outbox;
-create policy admin_read_outbox on public.coverage_email_outbox
+drop policy if exists admin_read_drafts on public.email_drafts;
+create policy admin_read_drafts on public.email_drafts
   for select to authenticated
   using (private.is_admin());
 
-create unique index if not exists coverage_email_outbox_open_warning
-  on public.coverage_email_outbox (subscription_id, warning_slot)
-  where sent_at is null and warning_slot is not null;
+drop policy if exists admin_update_drafts on public.email_drafts;
+create policy admin_update_drafts on public.email_drafts
+  for update to authenticated
+  using (private.is_admin())
+  with check (private.is_admin());
+
+create index if not exists email_drafts_status on public.email_drafts (status, created_at desc);
 
 -- ---------------------------------------------------------------------------
 -- Coverage changes. security definer, executable by service_role only.
@@ -278,7 +290,7 @@ declare
   v_ref text;
   v_coverage text;
   v_tello text;
-  v_outbox uuid;
+  v_draft uuid;
   v_body text;
   v_subject text;
   v_admin text := coalesce(nullif(trim(p_admin_email), ''), 'joeamilam@gmail.com');
@@ -322,11 +334,10 @@ begin
   limit 1;
 
   if v_sub.id is null then
-    insert into public.subscriptions (device_enduser_id, plan_name, monthly_amount, status, next_billing_date)
+    insert into public.subscriptions (device_enduser_id, plan_name, status, next_billing_date)
     values (
       v_link.id,
       coalesce(v_sim.data_plan, '50 GB Monthly'),
-      60,
       'active',
       (v_today + interval '1 month')::date
     )
@@ -355,11 +366,6 @@ begin
   if p_action = 'reactivate' and (v_link.status = 'cancelled' or v_sub.status = 'cancelled') then
     raise exception 'This service is canceled. Restarting requires a new SIM card.';
   end if;
-
-  delete from public.coverage_email_outbox
-  where subscription_id = v_sub.id
-    and kind = 'warning'
-    and sent_at is null;
 
   v_deadline := (v_today + interval '6 months')::date;
 
@@ -460,9 +466,9 @@ begin
     'Suspend pauses billing until they reactivate. They must reactivate within 6 months or the line is canceled.' || E'\n' ||
     'Cancel means a new SIM card has to be shipped before service can start again.';
 
-  insert into public.coverage_email_outbox (kind, to_email, subject, body_text, subscription_id)
-  values ('admin_action', v_admin, v_subject, v_body, v_sub.id)
-  returning id into v_outbox;
+  insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
+  values ('support@dockafi.com', v_admin, v_subject, v_body, 'tello_change', v_eu.id, p_device)
+  returning id into v_draft;
 
   return jsonb_build_object(
     'ok', true,
@@ -471,7 +477,7 @@ begin
     'auto_cancel_on', v_deadline,
     'reference', v_ref,
     'device_id', p_device,
-    'outbox_id', v_outbox
+    'draft_id', v_draft
   );
 end;
 $$;
@@ -510,13 +516,12 @@ begin
         'imei', d.imei,
         'data_plan', coalesce(sim.data_plan, sub.plan_name, '50 GB Monthly'),
         'coverage', coalesce(sub.status, de.status),
-        'auto_cancel_on', sub.auto_cancel_on,
-        'monthly_amount', sub.monthly_amount
+        'auto_cancel_on', sub.auto_cancel_on
       ) as item
     from public.device_enduser de
     join public.devices d on d.id = de.device_id
     left join lateral (
-      select s.status, s.plan_name, s.monthly_amount, s.auto_cancel_on
+      select s.status, s.plan_name, s.auto_cancel_on
       from public.subscriptions s
       where s.device_enduser_id = de.id
       order by case s.status when 'active' then 0 when 'suspended' then 1 else 2 end, s.created_at desc
@@ -549,6 +554,7 @@ begin
     'last_name', v_eu.last_name,
     'email', v_eu.email,
     'phone', v_eu.phone,
+    'must_change_password', v_eu.must_change_password,
     'preview_auto_cancel_on', (v_today + interval '6 months')::date,
     'devices', v_devices
   );
@@ -643,9 +649,9 @@ begin
         v_row.reseller_org_id
       );
 
-      insert into public.coverage_email_outbox (kind, to_email, subject, body_text, subscription_id)
+      insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
       values (
-        'auto_cancel',
+        'support@dockafi.com',
         v_admin,
         'DockaFi auto-cancel: deactivate Tello SIM for ' || v_name,
         'Suspended coverage reached the 6-month limit and was canceled in the platform.' || E'\n\n' ||
@@ -656,18 +662,22 @@ begin
           'Data plan: ' || v_row.data_plan || E'\n' ||
           'Request: ' || v_ref || E'\n\n' ||
           'Restarting later requires a new SIM card shipped to the customer.',
-        v_row.subscription_id
+        'auto_cancel',
+        v_row.end_user_id,
+        v_row.device_id
       );
-      insert into public.coverage_email_outbox (kind, to_email, subject, body_text, subscription_id)
+      insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
       values (
-        'customer_notice',
+        'support@dockafi.com',
         v_row.email,
         'Your DockaFi coverage was canceled',
         'Your DockaFi coverage was canceled because it stayed suspended through ' ||
           to_char(v_row.auto_cancel_on, 'FMMonth FMDD, YYYY') || '.' || E'\n\n' ||
-          'Restarting service requires a new SIM card shipped to you. The current SIM cannot be reused.' || E'\n\n' ||
-          v_portal,
-        v_row.subscription_id
+          'You were not billed while it was suspended. Restarting service requires a new SIM card shipped to you. The current SIM cannot be reused.' || E'\n\n' ||
+          'Sign in: ' || v_portal,
+        'customer_notice',
+        v_row.end_user_id,
+        v_row.device_id
       );
       v_cancels := v_cancels + 1;
       continue;
@@ -687,33 +697,21 @@ begin
       continue;
     end if;
 
-    if exists (
-      select 1 from public.coverage_email_outbox o
-      where o.subscription_id = v_row.subscription_id
-        and o.warning_slot = v_slot
-        and o.sent_at is null
-    ) then
-      continue;
-    end if;
-
-    insert into public.coverage_email_outbox (kind, to_email, subject, body_text, subscription_id, warning_slot)
+    insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
     values (
-      'warning',
+      'support@dockafi.com',
       v_row.email,
       'DockaFi coverage cancels on ' || to_char(v_row.auto_cancel_on, 'FMMonth FMDD, YYYY'),
       'Your DockaFi coverage is suspended and is set to cancel on ' ||
         to_char(v_row.auto_cancel_on, 'FMMonth FMDD, YYYY') || '.' || E'\n\n' ||
         'You will not be billed while it is suspended. Reactivate within 6 months or the device will be canceled. ' ||
         'After that cancellation, a new SIM card must be shipped to restart service.' || E'\n\n' ||
-        'Sign in to reactivate or cancel: ' || v_portal || E'\n\n' ||
+        'Sign in: ' || v_portal || E'\n\n' ||
         'This reminder is ' || v_slot || ' day' || case when v_slot = 1 then '' else 's' end || ' ahead of that date.',
-      v_row.subscription_id,
-      v_slot
-    )
-    on conflict (subscription_id, warning_slot) where sent_at is null and warning_slot is not null do nothing;
-    if not found then
-      continue;
-    end if;
+      'warning',
+      v_row.end_user_id,
+      v_row.device_id
+    );
 
     if v_slot = 30 then
       update public.subscriptions set warning_30_sent_on = v_today where id = v_row.subscription_id;
@@ -792,10 +790,12 @@ grant execute on function public.customer_portal_snapshot(uuid) to service_role;
 grant execute on function public.run_coverage_schedule(text, text) to service_role;
 
 -- ---------------------------------------------------------------------------
--- Brenden Milstead. No Auth user and no invite email.
+-- Brenden Milstead. Auth login uses the default password Dockafi1234.
 -- Craig Isom's cancelled device_enduser rows stay as history.
--- monthly_amount uses the ledger default of 60. Confirm the fee with Joe.
+-- A welcome draft is saved. Nothing is emailed.
 -- ---------------------------------------------------------------------------
+
+create extension if not exists pgcrypto;
 
 insert into public.end_users (first_name, last_name, email, status)
 select 'Brenden', 'Milstead', 'brendenmilstead@yahoo.com', 'active'
@@ -824,7 +824,7 @@ where lower(eu.email) = 'brendenmilstead@yahoo.com'
       and de.status = 'active'
   );
 
-insert into public.subscriptions (device_enduser_id, plan_name, monthly_amount, status, next_billing_date)
+insert into public.subscriptions (device_enduser_id, plan_name, status, next_billing_date)
 select
   de.id,
   coalesce((
@@ -832,7 +832,6 @@ select
     where sim.device_id = de.device_id
     limit 1
   ), '50 GB Monthly'),
-  60,
   'active',
   ((timezone('America/New_York', now()))::date + interval '1 month')::date
 from public.device_enduser de
@@ -843,5 +842,98 @@ where de.device_id = '9b5f038d-009f-4d49-a976-d5422621fef9'
   and not exists (
     select 1 from public.subscriptions s where s.device_enduser_id = de.id
   );
+
+do $brenden$
+declare
+  v_user uuid;
+  v_eu uuid;
+  v_device uuid := '9b5f038d-009f-4d49-a976-d5422621fef9';
+begin
+  if not exists (select 1 from public.devices where id = v_device) then
+    return;
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'auth' and table_name = 'users' and column_name = 'encrypted_password'
+  ) then
+    return;
+  end if;
+
+  perform set_config('search_path', 'public, extensions', true);
+
+  select id into v_eu from public.end_users where lower(email) = 'brendenmilstead@yahoo.com';
+  select id into v_user from auth.users where lower(email) = 'brendenmilstead@yahoo.com';
+
+  if v_user is null then
+    v_user := gen_random_uuid();
+    insert into auth.users (
+      instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
+      raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+      confirmation_token, recovery_token, email_change_token_new, email_change,
+      is_sso_user, is_anonymous
+    ) values (
+      '00000000-0000-0000-0000-000000000000',
+      v_user,
+      'authenticated',
+      'authenticated',
+      'brendenmilstead@yahoo.com',
+      crypt('Dockafi1234', gen_salt('bf')),
+      now(),
+      '{"provider":"email","providers":["email"],"role":"customer"}'::jsonb,
+      '{"first_name":"Brenden","last_name":"Milstead"}'::jsonb,
+      now(),
+      now(),
+      '',
+      '',
+      '',
+      '',
+      false,
+      false
+    );
+    insert into auth.identities (
+      id, provider_id, user_id, identity_data, provider, created_at, updated_at
+    ) values (
+      gen_random_uuid(),
+      v_user::text,
+      v_user,
+      jsonb_build_object('sub', v_user::text, 'email', 'brendenmilstead@yahoo.com'),
+      'email',
+      now(),
+      now()
+    );
+  end if;
+
+  update public.end_users
+    set auth_user_id = v_user,
+        must_change_password = true,
+        portal_invited_at = coalesce(portal_invited_at, now())
+    where id = v_eu;
+
+  insert into public.user_roles (user_id, role)
+  values (v_user, 'customer')
+  on conflict (user_id) do update set role = 'customer';
+
+  if not exists (
+    select 1 from public.email_drafts
+    where kind = 'welcome' and lower(to_email) = 'brendenmilstead@yahoo.com'
+  ) then
+    insert into public.email_drafts (from_address, to_email, subject, body_text, kind, end_user_id, device_id)
+    values (
+      'support@dockafi.com',
+      'brendenmilstead@yahoo.com',
+      'Your DockaFi customer portal login',
+      'Hi Brenden,' || E'\n\n' ||
+        'Your DockaFi customer portal login is ready.' || E'\n\n' ||
+        'Sign in: https://dockafiplatform.netlify.app/?portal=1' || E'\n' ||
+        'Email: brendenmilstead@yahoo.com' || E'\n' ||
+        'Temporary password: Dockafi1234' || E'\n\n' ||
+        'Please change this password after you sign in. You can keep using the portal if you wait, and the page will keep reminding you until you do.',
+      'welcome',
+      v_eu,
+      v_device
+    );
+  end if;
+end
+$brenden$;
 
 notify pgrst, 'reload schema';

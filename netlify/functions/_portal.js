@@ -1,8 +1,7 @@
 'use strict';
 
-const crypto = require('crypto');
 const { supabase, supabaseEnv, bearer, HttpError } = require('./_lib');
-const { sendEmail, mailerConfigured, mailerSetupMessage } = require('./_email');
+const { sendEmail, mailerConfigured } = require('./_email');
 const { addMonths, etToday } = require('./_coverage');
 
 const ADMIN_EMAIL_DEFAULT = 'joeamilam@gmail.com';
@@ -93,36 +92,55 @@ async function adminAuth(path, opts) {
   return data;
 }
 
-function randomPassword() {
-  return crypto.randomBytes(24).toString('base64url') + 'Aa1!';
+const FROM_ADDRESS = 'support@dockafi.com';
+const LINK_HOURS = 1;
+
+function defaultPassword() {
+  return process.env.PORTAL_DEFAULT_PASSWORD || 'Dockafi1234';
 }
 
-async function deliverOutbox(extraFilter) {
+function sendingEnabled() {
+  return process.env.PORTAL_SEND_EMAIL === 'true' && !!mailerConfigured();
+}
+
+async function queueDraft(fields) {
   requireService();
+  const created = await supabase('/rest/v1/email_drafts', {
+    method: 'POST',
+    body: JSON.stringify({
+      from_address: FROM_ADDRESS,
+      to_email: fields.to,
+      subject: fields.subject,
+      body_text: fields.text,
+      kind: fields.kind,
+      end_user_id: fields.endUserId || null,
+      device_id: fields.deviceId || null,
+      status: 'draft',
+    }),
+  });
+  const row = Array.isArray(created) ? created[0] : created;
+  if (row && row.id) await maybeSendDraft(row.id);
+  return row;
+}
+
+async function maybeSendDraft(id) {
+  if (!sendingEnabled() || !id) return { sent: false };
   const rows = await supabase(
-    '/rest/v1/coverage_email_outbox?sent_at=is.null&select=id,to_email,subject,body_text&order=created_at.asc' +
-    (extraFilter || '')
+    '/rest/v1/email_drafts?id=eq.' + encodeURIComponent(id) + '&status=eq.draft&select=id,to_email,subject,body_text'
   );
-  const results = [];
-  for (const row of rows || []) {
-    let sent = { sent: false, reason: mailerSetupMessage() };
-    if (mailerConfigured()) {
-      try {
-        sent = await sendEmail({ to: row.to_email, subject: row.subject, text: row.body_text });
-      } catch (err) {
-        sent = { sent: false, reason: err.message };
-      }
-    }
-    if (sent.sent) {
-      await supabase('/rest/v1/coverage_email_outbox?id=eq.' + encodeURIComponent(row.id), {
-        method: 'PATCH',
-        headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({ sent_at: new Date().toISOString() }),
-      });
-    }
-    results.push({ id: row.id, to: row.to_email, sent: !!sent.sent, reason: sent.reason || null });
+  const row = rows && rows[0];
+  if (!row) return { sent: false };
+  try {
+    await sendEmail({ to: row.to_email, subject: row.subject, text: row.body_text });
+  } catch (err) {
+    return { sent: false, reason: err.message };
   }
-  return results;
+  await supabase('/rest/v1/email_drafts?id=eq.' + encodeURIComponent(id), {
+    method: 'PATCH',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ status: 'sent', sent_at: new Date().toISOString(), sent_by: 'portal' }),
+  });
+  return { sent: true };
 }
 
 async function accountFor(userId) {
@@ -143,9 +161,9 @@ async function act(userId, deviceId, action, event) {
     p_portal_url: portalUrl(event),
   });
   let notified = false;
-  if (result && result.outbox_id) {
-    const delivery = await deliverOutbox('&id=eq.' + encodeURIComponent(result.outbox_id));
-    notified = !!(delivery[0] && delivery[0].sent);
+  if (result && result.draft_id) {
+    const delivery = await maybeSendDraft(result.draft_id);
+    notified = !!delivery.sent;
   }
   return {
     ok: true,
@@ -154,6 +172,7 @@ async function act(userId, deviceId, action, event) {
     auto_cancel_on: result && result.auto_cancel_on,
     reference: result && result.reference,
     device_id: result && result.device_id,
+    draft_saved: !!(result && result.draft_id),
     admin_notified: notified,
   };
 }
@@ -163,24 +182,38 @@ async function runSchedule(event) {
     p_admin_email: adminEmail(),
     p_portal_url: portalUrl(event),
   });
-  const delivery = await deliverOutbox('');
+  if (sendingEnabled()) {
+    const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const fresh = await supabase(
+      '/rest/v1/email_drafts?status=eq.draft&created_at=gte.' + encodeURIComponent(since) + '&select=id'
+    );
+    for (const row of fresh || []) await maybeSendDraft(row.id);
+  }
+  return { ok: true, warnings: summary && summary.warnings, cancellations: summary && summary.cancellations };
+}
+
+function welcomeMessage(name, email, portal) {
   return {
-    ok: true,
-    warnings: summary && summary.warnings,
-    cancellations: summary && summary.cancellations,
-    emails: delivery,
-    mailer: mailerConfigured() || null,
+    subject: 'Your DockaFi customer portal login',
+    text:
+      (name ? 'Hi ' + name + ',\n\n' : '') +
+      'Your DockaFi customer portal login is ready.\n\n' +
+      'Sign in: ' + portal + '\n' +
+      'Email: ' + email + '\n' +
+      'Temporary password: ' + defaultPassword() + '\n\n' +
+      'Please change this password after you sign in. You can keep using the portal if you wait, and the page will keep reminding you until you do.',
   };
 }
 
-function passwordMessage(kind, name, link) {
-  const greeting = name ? 'Hi ' + name + ',\n\n' : '';
-  const lead = kind === 'invite'
-    ? 'Use this link to set your DockaFi customer portal password. You will sign in with this email address.'
-    : 'Use this link to reset your DockaFi customer portal password.';
+function resetMessage(name, link) {
   return {
-    subject: kind === 'invite' ? 'Set your DockaFi portal password' : 'Reset your DockaFi portal password',
-    text: greeting + lead + '\n\n' + link + '\n\nIf you did not expect this email, you can ignore it. The link expires after a short time.',
+    subject: 'Reset your DockaFi portal password',
+    text:
+      (name ? 'Hi ' + name + ',\n\n' : '') +
+      'Use this link to set a new DockaFi customer portal password:\n\n' +
+      link + '\n\n' +
+      'The link expires about ' + LINK_HOURS + ' hour after it was created. If it has expired, an operator can regenerate it in Email drafts before sending.\n\n' +
+      'If you did not ask for this, you can ignore it.',
   };
 }
 
@@ -210,7 +243,7 @@ async function ensureCustomerAuth(email, first, last) {
         method: 'POST',
         body: JSON.stringify({
           email,
-          password: randomPassword(),
+          password: defaultPassword(),
           email_confirm: true,
           app_metadata: { role: 'customer' },
           user_metadata: { first_name: first, last_name: last },
@@ -248,6 +281,7 @@ async function ensureCustomerAuth(email, first, last) {
       body: JSON.stringify({ role: 'customer' }),
     });
   }
+  user.existed = !!row;
   return user;
 }
 
@@ -276,7 +310,6 @@ async function ensureSubscription(linkId, deviceId) {
     body: JSON.stringify({
       device_enduser_id: linkId,
       plan_name: plan,
-      monthly_amount: 60,
       status: 'active',
       next_billing_date: next,
     }),
@@ -316,18 +349,31 @@ async function linkDevice(endUser, device) {
   return link.id;
 }
 
-async function sendPasswordLink(kind, email, name, event) {
+async function saveResetDraft(email, name, endUserId, deviceId, event) {
   const link = await recoveryLink(email, event);
-  const message = passwordMessage(kind, name, link);
-  if (!mailerConfigured()) {
-    return { emailed: false, setup_link: link, reason: mailerSetupMessage() };
-  }
-  try {
-    await sendEmail({ to: email, subject: message.subject, text: message.text });
-    return { emailed: true, setup_link: null };
-  } catch (err) {
-    return { emailed: false, setup_link: link, reason: err.message };
-  }
+  const message = resetMessage(name, link);
+  const row = await queueDraft({
+    to: email,
+    subject: message.subject,
+    text: message.text,
+    kind: 'password_reset',
+    endUserId,
+    deviceId,
+  });
+  return { ok: true, draft_id: row && row.id };
+}
+
+async function saveWelcomeDraft(email, name, endUserId, deviceId, event) {
+  const message = welcomeMessage(name, email, portalUrl(event));
+  const row = await queueDraft({
+    to: email,
+    subject: message.subject,
+    text: message.text,
+    kind: 'welcome',
+    endUserId,
+    deviceId,
+  });
+  return { ok: true, draft_id: row && row.id, draft_kind: 'welcome' };
 }
 
 async function inviteCustomer(body, event) {
@@ -376,22 +422,20 @@ async function inviteCustomer(body, event) {
 
   await linkDevice(endUser, device);
   const authUser = await ensureCustomerAuth(email, first, last);
+  const already = authUser.existed;
   await supabase('/rest/v1/end_users?id=eq.' + encodeURIComponent(endUser.id), {
     method: 'PATCH',
     headers: { Prefer: 'return=minimal' },
     body: JSON.stringify({
       auth_user_id: authUser.id,
       portal_invited_at: new Date().toISOString(),
+      must_change_password: !already,
     }),
   });
-  const mail = await sendPasswordLink('invite', email, first, event);
-  return {
-    ok: true,
-    end_user_id: endUser.id,
-    emailed: mail.emailed,
-    setup_link: mail.setup_link,
-    reason: mail.reason || null,
-  };
+  const mail = already
+    ? await saveResetDraft(email, first, endUser.id, device.id, event)
+    : await saveWelcomeDraft(email, first, endUser.id, device.id, event);
+  return { ok: true, end_user_id: endUser.id, draft_id: mail.draft_id, draft_kind: already ? 'password_reset' : 'welcome' };
 }
 
 async function resendCustomer(body, event) {
@@ -401,7 +445,7 @@ async function resendCustomer(body, event) {
   if (isUuid(endUserId)) {
     const rows = await supabase(
       '/rest/v1/end_users?id=eq.' + encodeURIComponent(endUserId) +
-      '&select=id,first_name,last_name,email,phone,status,auth_user_id,device_enduser(id,status)&limit=1'
+      '&select=id,first_name,last_name,email,phone,status,auth_user_id,device_enduser(id,status,device_id)&limit=1'
     );
     endUser = rows && rows[0];
   } else if (emailInput) {
@@ -419,36 +463,77 @@ async function resendCustomer(body, event) {
     throw new HttpError(400, 'Link a device before sending a portal password email');
   }
   const email = String(endUser.email || '').trim().toLowerCase();
-  const authUser = await ensureCustomerAuth(email, endUser.first_name, endUser.last_name);
+  await ensureCustomerAuth(email, endUser.first_name, endUser.last_name);
+  const authUser = (await rpc('lookup_auth_email', { p_email: email }));
+  const authRow = Array.isArray(authUser) ? authUser[0] : null;
   await supabase('/rest/v1/end_users?id=eq.' + encodeURIComponent(endUser.id), {
     method: 'PATCH',
     headers: { Prefer: 'return=minimal' },
     body: JSON.stringify({
-      auth_user_id: authUser.id,
+      auth_user_id: authRow && authRow.id,
       portal_invited_at: new Date().toISOString(),
     }),
   });
-  const kind = endUser.auth_user_id ? 'recovery' : 'invite';
-  const mail = await sendPasswordLink(kind, email, endUser.first_name, event);
-  return {
-    ok: true,
-    end_user_id: endUser.id,
-    emailed: mail.emailed,
-    setup_link: mail.setup_link,
-    reason: mail.reason || null,
-  };
+  const deviceId = (links.find((link) => link.status === 'active' || link.status === 'suspended') || {}).device_id;
+  const mail = await saveResetDraft(email, endUser.first_name, endUser.id, deviceId, event);
+  return { ok: true, end_user_id: endUser.id, draft_id: mail.draft_id, draft_kind: 'password_reset' };
 }
 
 async function recoverPassword(email, event) {
   const normalized = String(email || '').trim().toLowerCase();
   if (!/^\S+@\S+\.\S+$/.test(normalized)) throw new HttpError(400, 'A valid email is required');
-  if (!mailerConfigured()) throw new HttpError(503, mailerSetupMessage());
   const found = await rpc('lookup_auth_email', { p_email: normalized });
   const row = Array.isArray(found) ? found[0] : null;
-  if (!row) return { ok: true };
-  const endUser = await loadEndUserByEmail(normalized);
-  const mail = await sendPasswordLink('recovery', normalized, endUser && endUser.first_name, event);
-  if (!mail.emailed) throw new HttpError(502, mail.reason || 'Could not send the password email');
+  if (row && row.role !== 'admin') {
+    const endUser = await loadEndUserByEmail(normalized);
+    let deviceId = null;
+    if (endUser) {
+      const links = await supabase(
+        '/rest/v1/device_enduser?end_user_id=eq.' + encodeURIComponent(endUser.id) +
+        '&status=in.(active,suspended)&select=device_id&limit=1'
+      );
+      deviceId = links && links[0] && links[0].device_id;
+    }
+    await saveResetDraft(normalized, endUser && endUser.first_name, endUser && endUser.id, deviceId, event);
+  }
+  return { ok: true };
+}
+
+async function changePassword(user, password) {
+  const next = String(password || '');
+  if (next.length < 8) throw new HttpError(400, 'Use at least 8 characters');
+  if (next === defaultPassword()) throw new HttpError(400, 'Choose a different password');
+  await adminAuth('/auth/v1/admin/users/' + user.id, {
+    method: 'PUT',
+    body: JSON.stringify({ password: next }),
+  });
+  await supabase('/rest/v1/end_users?auth_user_id=eq.' + encodeURIComponent(user.id), {
+    method: 'PATCH',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ must_change_password: false }),
+  });
+  return { ok: true };
+}
+
+async function regenerateDraft(draftId, event) {
+  if (!isUuid(draftId)) throw new HttpError(400, 'Draft id is required');
+  const rows = await supabase('/rest/v1/email_drafts?id=eq.' + encodeURIComponent(draftId) + '&select=*');
+  const draft = rows && rows[0];
+  if (!draft) throw new HttpError(404, 'Draft not found');
+  if (draft.kind !== 'password_reset') throw new HttpError(400, 'Only password-reset drafts have a link to regenerate');
+  const endUser = await loadEndUserByEmail(draft.to_email);
+  const message = resetMessage(endUser && endUser.first_name, await recoveryLink(draft.to_email, event));
+  await supabase('/rest/v1/email_drafts?id=eq.' + encodeURIComponent(draftId), {
+    method: 'PATCH',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({
+      subject: message.subject,
+      body_text: message.text,
+      status: 'draft',
+      sent_at: null,
+      sent_by: null,
+    }),
+  });
   return { ok: true };
 }
 
@@ -464,5 +549,7 @@ module.exports = {
   inviteCustomer,
   resendCustomer,
   recoverPassword,
-  deliverOutbox,
+  changePassword,
+  regenerateDraft,
+  defaultPassword,
 };
