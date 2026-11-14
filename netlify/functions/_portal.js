@@ -92,8 +92,11 @@ async function adminAuth(path, opts) {
   return data;
 }
 
-const FROM_ADDRESS = 'support@dockafi.com';
 const LINK_HOURS = 1;
+
+function fromAddress() {
+  return (process.env.PORTAL_FROM_EMAIL || 'aquaease.creations@gmail.com').trim();
+}
 
 function defaultPassword() {
   return process.env.PORTAL_DEFAULT_PASSWORD || 'Dockafi1234';
@@ -108,7 +111,7 @@ async function queueDraft(fields) {
   const created = await supabase('/rest/v1/email_drafts', {
     method: 'POST',
     body: JSON.stringify({
-      from_address: FROM_ADDRESS,
+      from_address: fromAddress(),
       to_email: fields.to,
       subject: fields.subject,
       body_text: fields.text,
